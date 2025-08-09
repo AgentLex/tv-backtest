@@ -1,5 +1,7 @@
 {
   "functions": {
-    "api/**": { "region": "hnd1" }
+    "api/**": {
+      "regions": ["hnd1"]
+    }
   }
 }

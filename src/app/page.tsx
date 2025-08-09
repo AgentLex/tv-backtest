@@ -6,7 +6,7 @@ import type { Candle } from "@/lib/types";
 import { SMA, EMA } from "@/lib/indicators";
 import { backtestDualEMA, type Trade } from "@/lib/backtest";
 
-// 声明全局（standalone 图表库）
+// standalone 版本挂在 window 上
 declare global {
   interface Window {
     LightweightCharts?: {
@@ -22,25 +22,33 @@ type Interval =
   | "1D" | "3D" | "1W" | "1M";
 
 export default function Home() {
-  const containerRef = useRef<HTMLDivElement>(null);
-  const chartRef = useRef<any>(null);
+  // 上方价格图容器 & 引用
+  const priceRef = useRef<HTMLDivElement>(null);
+  const priceChartRef = useRef<any>(null);
   const candleRef = useRef<any>(null);
   const smaRef = useRef<any>(null);
   const emaRef = useRef<any>(null);
+
+  // 下方资金曲线图容器 & 引用
+  const equityRef = useRef<HTMLDivElement>(null);
+  const equityChartRef = useRef<any>(null);
+  const equitySeriesRef = useRef<any>(null);
+
   const dataRef = useRef<Candle[]>([]);
 
   const [symbol, setSymbol] = useState("BTCUSDT");
   const [interval, setInterval] = useState<Interval>("1H");
   const [bars, setBars] = useState(200);
 
+  // 价格图指标显示用
   const [smaLen, setSmaLen] = useState(20);
   const [emaLen, setEmaLen] = useState(50);
 
   // 回测参数
   const [fastLen, setFastLen] = useState(20);
   const [slowLen, setSlowLen] = useState(50);
-  const [feeBps, setFeeBps] = useState(6);      // 单边 6bps=0.06%
-  const [slipBps, setSlipBps] = useState(5);    // 单边 5bps=0.05%
+  const [feeBps, setFeeBps] = useState(6);
+  const [slipBps, setSlipBps] = useState(5);
 
   const [loading, setLoading] = useState(true);
   const [errorMsg, setErrorMsg] = useState("");
@@ -51,34 +59,67 @@ export default function Home() {
 
   useEffect(() => {
     let cleanup: (() => void) | undefined;
+
     (async () => {
       try {
+        // 等图表脚本
         await waitFor(() => !!window.LightweightCharts?.createChart, 8000, 50);
-        if (!containerRef.current) return;
+        if (!priceRef.current || !equityRef.current) return;
 
         const { createChart } = window.LightweightCharts!;
-        const chart = createChart(containerRef.current, {
-          width: containerRef.current.clientWidth,
+
+        // 价格图
+        const priceChart = createChart(priceRef.current, {
+          width: priceRef.current.clientWidth,
           height: 560,
           layout: { textColor: "#333" },
           grid: { horzLines: { visible: true }, vertLines: { visible: true } },
           timeScale: { timeVisible: true, secondsVisible: true, rightOffset: 6, barSpacing: 8 },
           crosshair: { mode: 0 },
         });
-        chartRef.current = chart;
+        priceChartRef.current = priceChart;
 
-        const candle = chart.addCandlestickSeries();
-        const sma = chart.addLineSeries({ lineWidth: 1 });
-        const ema = chart.addLineSeries({ lineWidth: 1 });
+        const candle = priceChart.addCandlestickSeries();
+        const sma = priceChart.addLineSeries({ lineWidth: 1 });
+        const ema = priceChart.addLineSeries({ lineWidth: 1 });
         candleRef.current = candle; smaRef.current = sma; emaRef.current = ema;
 
+        // 资金曲线图
+        const equityChart = createChart(equityRef.current, {
+          width: equityRef.current.clientWidth,
+          height: 220,
+          layout: { textColor: "#333", background: { color: "#fff" } },
+          grid: { horzLines: { visible: true }, vertLines: { visible: false } },
+          timeScale: { timeVisible: true, secondsVisible: true, rightOffset: 6, barSpacing: 8 },
+          rightPriceScale: { visible: true },
+          crosshair: { mode: 0 },
+        });
+        equityChartRef.current = equityChart;
+        const equityLine = equityChart.addLineSeries({ lineWidth: 2 });
+        equitySeriesRef.current = equityLine;
+
+        // 两个图表宽度自适应
         const onResize = () => {
-          if (!containerRef.current) return;
-          chart.applyOptions({ width: containerRef.current.clientWidth });
+          if (!priceRef.current || !equityRef.current) return;
+          priceChart.applyOptions({ width: priceRef.current.clientWidth });
+          equityChart.applyOptions({ width: equityRef.current.clientWidth });
         };
         window.addEventListener("resize", onResize);
-        cleanup = () => { window.removeEventListener("resize", onResize); chart.remove(); };
 
+        // 简单同步时间轴可视范围（从价格图同步到资金曲线）
+        priceChart.timeScale().subscribeVisibleLogicalRangeChange((range: any) => {
+          try {
+            equityChart.timeScale().setVisibleLogicalRange(range);
+          } catch { /* noop */ }
+        });
+
+        cleanup = () => {
+          window.removeEventListener("resize", onResize);
+          priceChart.remove();
+          equityChart.remove();
+        };
+
+        // 首次加载
         await loadData(symbol, interval, bars);
       } catch (e: any) {
         setErrorMsg(e?.message ?? String(e));
@@ -86,17 +127,20 @@ export default function Home() {
         setLoading(false);
       }
     })();
+
     return () => cleanup?.();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  // 切换品种/周期/数量重新拉数据
   useEffect(() => {
-    if (!chartRef.current) return;
+    if (!priceChartRef.current) return;
     setLoading(true);
     loadData(symbol, interval, bars).finally(() => setLoading(false));
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [symbol, interval, bars]);
 
+  // 指标周期变化时，仅重算指标
   useEffect(() => {
     if (!dataRef.current.length) return;
     applyIndicators(dataRef.current, smaLen, emaLen, smaRef.current, emaRef.current);
@@ -113,12 +157,17 @@ export default function Home() {
 
       dataRef.current = arr;
 
+      // 设置K线
       candleRef.current.setData(
         arr.map(d => ({ time: d.time as any, open: d.open, high: d.high, low: d.low, close: d.close }))
       );
-      chartRef.current.timeScale().fitContent();
+      priceChartRef.current.timeScale().fitContent();
 
+      // 叠加指标
       applyIndicators(arr, smaLen, emaLen, smaRef.current, emaRef.current);
+
+      // 清空旧的资金曲线（避免残影）
+      equitySeriesRef.current.setData([]);
     } catch (e: any) {
       setErrorMsg(e?.message ?? String(e));
       console.error(e);
@@ -129,32 +178,42 @@ export default function Home() {
     const arr = dataRef.current;
     if (!arr.length) return;
 
-    // 用 EMA 做策略（也可改成 SMA）
+    // 策略用 EMA（你也可以改成 SMA）
     const closes = arr.map(d => ({ close: d.close }));
     const f = EMA(closes, fastLen);
     const s = EMA(closes, slowLen);
 
-    const { stats, trades, markers } = backtestDualEMA(arr, f, s, {
+    const { stats, trades, markers, equityCurve } = backtestDualEMA(arr, f, s, {
       feeBps, slippageBps: slipBps,
     });
 
     setBtStats(stats);
     setBtTrades(trades);
 
-    // 在图上打点
-    // @ts-ignore
+    // 在价格图上打买卖点
     candleRef.current.setMarkers(markers);
+
+    // 在下方图显示资金曲线（value=1 起步）
+    equitySeriesRef.current.setData(
+      equityCurve.map(pt => ({ time: pt.time as any, value: pt.value }))
+    );
+
+    // 让资金曲线可视范围跟价格图一致
+    try {
+      const r = priceChartRef.current.timeScale().getVisibleLogicalRange();
+      equityChartRef.current.timeScale().setVisibleLogicalRange(r);
+    } catch { /* noop */ }
   }
 
   return (
-    <main style={{ minHeight: "100vh", padding: 24 }}>
+    <main style={{ minHeight: "100vh", padding: 16 }}>
       <Script
         src="https://unpkg.com/lightweight-charts@4.2.0/dist/lightweight-charts.standalone.production.js"
         strategy="afterInteractive"
       />
 
-      <h1 style={{ fontSize: 20, fontWeight: 600, marginBottom: 12 }}>
-        小傻瓜量化 · Bitget 实盘K线 + MA/EMA + 回测
+      <h1 style={{ fontSize: 20, fontWeight: 700, marginBottom: 12 }}>
+        小傻瓜量化 · Bitget 实盘K线 + MA/EMA + 回测 + 资金曲线
       </h1>
 
       {/* 行情/指标控制区 */}
@@ -184,7 +243,7 @@ export default function Home() {
       </div>
 
       {/* 回测控制区 */}
-      <div style={{ display: "flex", gap: 12, alignItems: "center", flexWrap: "wrap", marginBottom: 12 }}>
+      <div style={{ display: "flex", gap: 12, alignItems: "center", flexWrap: "wrap", marginBottom: 8 }}>
         <strong>回测 · 双 EMA</strong>
         <label>Fast</label>
         <input type="number" min={2} max={200} value={fastLen}
@@ -205,12 +264,15 @@ export default function Home() {
         <button onClick={runBacktest} style={{ padding: "6px 10px" }}>运行回测</button>
       </div>
 
-      {/* 图表 */}
-      <div ref={containerRef} style={{ width: "100%", border: "1px solid #eee", borderRadius: 12, height: 560 }} />
+      {/* 上：价格图 */}
+      <div ref={priceRef} style={{ width: "100%", border: "1px solid #eee", borderRadius: 12, height: 560, marginBottom: 12 }} />
+
+      {/* 下：资金曲线 */}
+      <div ref={equityRef} style={{ width: "100%", border: "1px solid #eee", borderRadius: 12, height: 220 }} />
 
       {/* 统计与最近交易 */}
       {btStats && (
-        <div style={{ marginTop: 16, lineHeight: 1.8 }}>
+        <div style={{ marginTop: 12, lineHeight: 1.8 }}>
           <strong>回测结果</strong><br />
           交易笔数：{btStats.nTrades}；胜率：{(btStats.winRate * 100).toFixed(1)}%；
           总收益：{(btStats.totalReturn * 100).toFixed(1)}%；
@@ -221,7 +283,7 @@ export default function Home() {
 
       {btTrades.length > 0 && (
         <div style={{ marginTop: 8 }}>
-          <details open>
+          <details>
             <summary>最近 5 笔交易</summary>
             <ul style={{ marginTop: 8 }}>
               {btTrades.slice(-5).map((t, i) => (
@@ -249,6 +311,7 @@ function applyIndicators(arr: Candle[], sLen: number, eLen: number, smaSeries: a
   emaSeries.setData(emaArr.map((v, i) => (Number.isFinite(v) ? { time: times[i], value: v } : null)).filter(Boolean));
 }
 
+// 等待条件成立（等待脚本加载完成）
 async function waitFor(cond: () => boolean, timeoutMs = 3000, intervalMs = 50) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {

@@ -2,7 +2,8 @@
 import { NextResponse } from "next/server";
 import { z } from "zod";
 
-export const dynamic = "force-dynamic"; // 避免被缓存
+export const runtime = "edge";          // ✅ 使用 Edge Runtime（免费）
+export const dynamic = "force-dynamic"; // 避免缓存（已存在可保留）
 
 // Bitget 允许的粒度（granularity）
 const GRANULARITY = new Set([

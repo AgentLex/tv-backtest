@@ -33,7 +33,7 @@ export default function Home() {
   const equityRef = useRef<HTMLDivElement>(null);
   const equityChartRef = useRef<any>(null);
   const equitySeriesRef = useRef<any>(null);
-  const equityDataRef = useRef<{ time: number; value: number }[]>([]); // ← 导出资金曲线要用
+  const equityDataRef = useRef<{ time: number; value: number }[]>([]); // 导出资金曲线要用
 
   const dataRef = useRef<Candle[]>([]);
 
@@ -57,6 +57,31 @@ export default function Home() {
     nTrades: number; winRate: number; totalReturn: number; maxDrawdown: number; cagr: number;
   }>(null);
   const [btTrades, setBtTrades] = useState<Trade[]>([]);
+
+  // ===== Watchlist（自选列表）状态与持久化 =====
+  const [watchlist, setWatchlist] = useState<string[]>(["BTCUSDT", "ETHUSDT", "SOLUSDT"]);
+  const [newSymbol, setNewSymbol] = useState("");
+
+  // 首次加载：从 localStorage 恢复
+  useEffect(() => {
+    try {
+      const raw = localStorage.getItem("tvbt-watchlist-v1");
+      if (raw) {
+        const arr = JSON.parse(raw);
+        if (Array.isArray(arr) && arr.every(s => typeof s === "string")) {
+          // 确保当前 symbol 在列表里
+          const restored = [...new Set([symbol, ...arr])];
+          setWatchlist(restored);
+        }
+      }
+    } catch { /* noop */ }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // 列表变化时自动保存
+  useEffect(() => {
+    localStorage.setItem("tvbt-watchlist-v1", JSON.stringify(watchlist));
+  }, [watchlist]);
 
   useEffect(() => {
     let cleanup: (() => void) | undefined;
@@ -206,7 +231,32 @@ export default function Home() {
       const r = priceChartRef.current.timeScale().getVisibleLogicalRange();
       equityChartRef.current.timeScale().setVisibleLogicalRange(r);
     } catch { /* noop */ }
-  } // ← runBacktest 结束
+  } // runBacktest 结束
+
+  // ===== Watchlist 操作 =====
+  function addToWatchlist() {
+    const s = newSymbol.trim().toUpperCase();
+    if (!s) return;
+    if (!/^[A-Z0-9]+$/.test(s)) {
+      alert("只支持字母数字组合的交易对，比如 BTCUSDT");
+      return;
+    }
+    setWatchlist(prev => [...new Set([s, ...prev])]);
+    setNewSymbol("");
+  }
+
+  function removeFromWatchlist(sym: string) {
+    setWatchlist(prev => {
+      const filtered = prev.filter(x => x !== sym);
+      // 如果删掉的是当前 symbol，切换到剩余列表的第一个（若有）
+      if (symbol === sym && filtered.length > 0) setSymbol(filtered[0]);
+      return filtered;
+    });
+  }
+
+  function selectFromWatchlist(sym: string) {
+    setSymbol(sym);
+  }
 
   // 导出：交易明细
   function exportCSV() {
@@ -231,7 +281,7 @@ export default function Home() {
     a.download = `${symbol}_${interval}_dualEMA_trades.csv`;
     a.click();
     URL.revokeObjectURL(url);
-  } // ← exportCSV 结束
+  }
 
   // 导出：资金曲线
   function exportEquityCSV() {
@@ -253,7 +303,7 @@ export default function Home() {
     a.download = `${symbol}_${interval}_equity_curve.csv`;
     a.click();
     URL.revokeObjectURL(url);
-  } // ← exportEquityCSV 结束
+  }
 
   return (
     <main style={{ minHeight: "100vh", padding: 16 }}>
@@ -265,6 +315,58 @@ export default function Home() {
       <h1 style={{ fontSize: 20, fontWeight: 700, marginBottom: 12 }}>
         小傻瓜量化 · Bitget 实盘K线 + MA/EMA + 回测 + 资金曲线
       </h1>
+
+      {/* 自选列表条 */}
+      <div style={{
+        display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap",
+        padding: "8px 0", marginBottom: 8, borderBottom: "1px dashed #eee"
+      }}>
+        <label style={{ fontWeight: 600 }}>自选：</label>
+        <input
+          value={newSymbol}
+          onChange={e => setNewSymbol(e.target.value.toUpperCase())}
+          onKeyDown={e => { if (e.key === "Enter") addToWatchlist(); }}
+          placeholder="如：BTCUSDT"
+          style={{ width: 140, height: 28, padding: "0 8px" }}
+        />
+        <button onClick={addToWatchlist} style={{ padding: "6px 10px" }}>添加</button>
+
+        {/* 自选标签列表 */}
+        <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+          {watchlist.map((sym) => (
+            <div
+              key={sym}
+              onClick={() => selectFromWatchlist(sym)}
+              title="点击切换"
+              style={{
+                display: "inline-flex",
+                alignItems: "center",
+                gap: 6,
+                padding: "4px 8px",
+                borderRadius: 999,
+                border: "1px solid #ddd",
+                cursor: "pointer",
+                background: sym === symbol ? "#eef6ff" : "#fafafa",
+                fontWeight: sym === symbol ? 700 : 400
+              }}
+            >
+              <span>{sym}{sym === symbol ? " ⭐" : ""}</span>
+              <span
+                title="移出自选"
+                onClick={(e) => { e.stopPropagation(); removeFromWatchlist(sym); }}
+                style={{
+                  display: "inline-flex",
+                  width: 16, height: 16, borderRadius: 999,
+                  alignItems: "center", justifyContent: "center",
+                  border: "1px solid #ddd", fontSize: 12, lineHeight: "14px", marginLeft: 4
+                }}
+              >
+                ×
+              </span>
+            </div>
+          ))}
+        </div>
+      </div>
 
       {/* 行情/指标控制区 */}
       <div style={{ display: "flex", gap: 12, alignItems: "center", flexWrap: "wrap", marginBottom: 12 }}>

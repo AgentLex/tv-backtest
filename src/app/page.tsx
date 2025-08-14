@@ -33,6 +33,7 @@ export default function Home() {
   const equityRef = useRef<HTMLDivElement>(null);
   const equityChartRef = useRef<any>(null);
   const equitySeriesRef = useRef<any>(null);
+  const equityDataRef = useRef<{ time: number; value: number }[]>([]); // ← 导出资金曲线要用
 
   const dataRef = useRef<Candle[]>([]);
 
@@ -168,6 +169,7 @@ export default function Home() {
 
       // 清空旧的资金曲线（避免残影）
       equitySeriesRef.current.setData([]);
+      equityDataRef.current = [];
     } catch (e: any) {
       setErrorMsg(e?.message ?? String(e));
       console.error(e);
@@ -189,8 +191,9 @@ export default function Home() {
 
     setBtStats(stats);
     setBtTrades(trades);
+    equityDataRef.current = equityCurve; // 存起来用于导出
 
-    // 在价格图上打买卖点
+    // 在价格图上打点
     candleRef.current.setMarkers(markers);
 
     // 在下方图显示资金曲线（value=1 起步）
@@ -203,7 +206,54 @@ export default function Home() {
       const r = priceChartRef.current.timeScale().getVisibleLogicalRange();
       equityChartRef.current.timeScale().setVisibleLogicalRange(r);
     } catch { /* noop */ }
-  }
+  } // ← runBacktest 结束
+
+  // 导出：交易明细
+  function exportCSV() {
+    if (!btTrades.length) {
+      alert("还没有回测交易，先点一下【运行回测】吧～");
+      return;
+    }
+    const headers = ["entryTime","exitTime","entryPrice","exitPrice","side","pnlPct"];
+    const rows = btTrades.map(t => [
+      new Date(t.entryTime * 1000).toISOString(),
+      new Date(t.exitTime * 1000).toISOString(),
+      t.entryPrice.toFixed(6),
+      t.exitPrice.toFixed(6),
+      t.side,
+      (t.pnlPct * 100).toFixed(4) + "%"
+    ]);
+    const csv = [headers.join(","), ...rows.map(r => r.join(","))].join("\n");
+    const blob = new Blob([csv], { type: "text/csv;charset=utf-8;" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `${symbol}_${interval}_dualEMA_trades.csv`;
+    a.click();
+    URL.revokeObjectURL(url);
+  } // ← exportCSV 结束
+
+  // 导出：资金曲线
+  function exportEquityCSV() {
+    const data = equityDataRef.current;
+    if (!data.length) {
+      alert("资金曲线还没有生成，先运行回测吧～");
+      return;
+    }
+    const headers = ["time","value"];
+    const rows = data.map(pt => [
+      new Date(pt.time * 1000).toISOString(),
+      pt.value.toFixed(6),
+    ]);
+    const csv = [headers.join(","), ...rows.map(r => r.join(","))].join("\n");
+    const blob = new Blob([csv], { type: "text/csv;charset=utf-8;" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `${symbol}_${interval}_equity_curve.csv`;
+    a.click();
+    URL.revokeObjectURL(url);
+  } // ← exportEquityCSV 结束
 
   return (
     <main style={{ minHeight: "100vh", padding: 16 }}>
@@ -227,18 +277,24 @@ export default function Home() {
           )}
         </select>
         <label>Bars</label>
-        <input type="number" min={1} max={200} value={bars}
-               onChange={e => setBars(Math.min(Math.max(Number(e.target.value) || 200, 1), 200))}
-               style={{ width: 80 }} />
+        <input
+          type="number" min={1} max={200} value={bars}
+          onChange={e => setBars(Math.min(Math.max(Number(e.target.value) || 200, 1), 200))}
+          style={{ width: 80 }}
+        />
         <span style={{ width: 16 }} />
         <label>MA</label>
-        <input type="number" min={2} max={500} value={smaLen}
-               onChange={e => setSmaLen(Math.max(2, Number(e.target.value) || 20))}
-               style={{ width: 70 }} />
+        <input
+          type="number" min={2} max={500} value={smaLen}
+          onChange={e => setSmaLen(Math.max(2, Number(e.target.value) || 20))}
+          style={{ width: 70 }}
+        />
         <label>EMA</label>
-        <input type="number" min={2} max={500} value={emaLen}
-               onChange={e => setEmaLen(Math.max(2, Number(e.target.value) || 50))}
-               style={{ width: 70 }} />
+        <input
+          type="number" min={2} max={500} value={emaLen}
+          onChange={e => setEmaLen(Math.max(2, Number(e.target.value) || 50))}
+          style={{ width: 70 }}
+        />
         <span style={{ color: "#666" }}>{loading ? "加载中…" : errorMsg ? `❌ ${errorMsg}` : "✅ 就绪"}</span>
       </div>
 
@@ -246,29 +302,45 @@ export default function Home() {
       <div style={{ display: "flex", gap: 12, alignItems: "center", flexWrap: "wrap", marginBottom: 8 }}>
         <strong>回测 · 双 EMA</strong>
         <label>Fast</label>
-        <input type="number" min={2} max={200} value={fastLen}
-               onChange={e => setFastLen(Math.max(2, Number(e.target.value) || 20))}
-               style={{ width: 70 }} />
+        <input
+          type="number" min={2} max={200} value={fastLen}
+          onChange={e => setFastLen(Math.max(2, Number(e.target.value) || 20))}
+          style={{ width: 70 }}
+        />
         <label>Slow</label>
-        <input type="number" min={3} max={500} value={slowLen}
-               onChange={e => setSlowLen(Math.max(3, Number(e.target.value) || 50))}
-               style={{ width: 70 }} />
+        <input
+          type="number" min={3} max={500} value={slowLen}
+          onChange={e => setSlowLen(Math.max(3, Number(e.target.value) || 50))}
+          style={{ width: 70 }}
+        />
         <label>Fee(bps)</label>
-        <input type="number" min={0} max={50} value={feeBps}
-               onChange={e => setFeeBps(Math.max(0, Number(e.target.value) || 6))}
-               style={{ width: 70 }} />
+        <input
+          type="number" min={0} max={50} value={feeBps}
+          onChange={e => setFeeBps(Math.max(0, Number(e.target.value) || 6))}
+          style={{ width: 70 }}
+        />
         <label>Slip(bps)</label>
-        <input type="number" min={0} max={50} value={slipBps}
-               onChange={e => setSlipBps(Math.max(0, Number(e.target.value) || 5))}
-               style={{ width: 70 }} />
+        <input
+          type="number" min={0} max={50} value={slipBps}
+          onChange={e => setSlipBps(Math.max(0, Number(e.target.value) || 5))}
+          style={{ width: 70 }}
+        />
         <button onClick={runBacktest} style={{ padding: "6px 10px" }}>运行回测</button>
+        <button onClick={exportCSV} style={{ padding: "6px 10px" }}>导出CSV</button>
+        <button onClick={exportEquityCSV} style={{ padding: "6px 10px" }}>导出资金曲线</button>
       </div>
 
       {/* 上：价格图 */}
-      <div ref={priceRef} style={{ width: "100%", border: "1px solid #eee", borderRadius: 12, height: 560, marginBottom: 12 }} />
+      <div
+        ref={priceRef}
+        style={{ width: "100%", border: "1px solid #eee", borderRadius: 12, height: 560, marginBottom: 12 }}
+      />
 
       {/* 下：资金曲线 */}
-      <div ref={equityRef} style={{ width: "100%", border: "1px solid #eee", borderRadius: 12, height: 220 }} />
+      <div
+        ref={equityRef}
+        style={{ width: "100%", border: "1px solid #eee", borderRadius: 12, height: 220 }}
+      />
 
       {/* 统计与最近交易 */}
       {btStats && (
@@ -307,8 +379,12 @@ function applyIndicators(arr: Candle[], sLen: number, eLen: number, smaSeries: a
   const emaArr = EMA(closes, eLen);
   const times = arr.map(d => d.time as any);
 
-  smaSeries.setData(smaArr.map((v, i) => (Number.isFinite(v) ? { time: times[i], value: v } : null)).filter(Boolean));
-  emaSeries.setData(emaArr.map((v, i) => (Number.isFinite(v) ? { time: times[i], value: v } : null)).filter(Boolean));
+  smaSeries.setData(
+    smaArr.map((v, i) => (Number.isFinite(v) ? { time: times[i], value: v } : null)).filter(Boolean)
+  );
+  emaSeries.setData(
+    emaArr.map((v, i) => (Number.isFinite(v) ? { time: times[i], value: v } : null)).filter(Boolean)
+  );
 }
 
 // 等待条件成立（等待脚本加载完成）

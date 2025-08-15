@@ -6,7 +6,7 @@ import type { Candle } from "@/lib/types";
 import { SMA, EMA } from "@/lib/indicators";
 import { backtestDualEMA, type Trade } from "@/lib/backtest";
 
-// standalone 版本挂在 window 上
+// lightweight-charts standalone 掛在 window 上
 declare global {
   interface Window {
     LightweightCharts?: {
@@ -21,27 +21,30 @@ type Interval =
   | "1H" | "4H" | "6H" | "12H"
   | "1D" | "3D" | "1W" | "1M";
 
+const QUICK_INTERVALS: Interval[] = ["1m", "15m", "1H", "4H", "1D"];
+
 export default function Home() {
-  // 上方价格图容器 & 引用
+  // —— 图表 refs ——
   const priceRef = useRef<HTMLDivElement>(null);
   const priceChartRef = useRef<any>(null);
   const candleRef = useRef<any>(null);
   const smaRef = useRef<any>(null);
   const emaRef = useRef<any>(null);
 
-  // 下方资金曲线图容器 & 引用
   const equityRef = useRef<HTMLDivElement>(null);
   const equityChartRef = useRef<any>(null);
   const equitySeriesRef = useRef<any>(null);
-  const equityDataRef = useRef<{ time: number; value: number }[]>([]); // 导出资金曲线要用
 
+  // 数据缓存
   const dataRef = useRef<Candle[]>([]);
+  const equityDataRef = useRef<{ time: number; value: number }[]>([]);
 
+  // —— 页面状态 ——
   const [symbol, setSymbol] = useState("BTCUSDT");
   const [interval, setInterval] = useState<Interval>("1H");
   const [bars, setBars] = useState(200);
 
-  // 价格图指标显示用
+  // 指标参数
   const [smaLen, setSmaLen] = useState(20);
   const [emaLen, setEmaLen] = useState(50);
 
@@ -51,44 +54,29 @@ export default function Home() {
   const [feeBps, setFeeBps] = useState(6);
   const [slipBps, setSlipBps] = useState(5);
 
+  // UI
   const [loading, setLoading] = useState(true);
   const [errorMsg, setErrorMsg] = useState("");
+
+  // 回测结果
   const [btStats, setBtStats] = useState<null | {
     nTrades: number; winRate: number; totalReturn: number; maxDrawdown: number; cagr: number;
   }>(null);
   const [btTrades, setBtTrades] = useState<Trade[]>([]);
 
-  // ===== Watchlist（自选列表）状态与持久化 =====
-  const [watchlist, setWatchlist] = useState<string[]>(["BTCUSDT", "ETHUSDT", "SOLUSDT"]);
-  const [newSymbol, setNewSymbol] = useState("");
+  // 交易对列表 & 收藏
+  const [allPerps, setAllPerps] = useState<string[]>([]);
+  const [favs, setFavs] = useState<string[]>([]);
 
-  // 首次加载：从 localStorage 恢复
-  useEffect(() => {
-    try {
-      const raw = localStorage.getItem("tvbt-watchlist-v1");
-      if (raw) {
-        const arr = JSON.parse(raw);
-        if (Array.isArray(arr) && arr.every(s => typeof s === "string")) {
-          // 确保当前 symbol 在列表里
-          const restored = [...new Set([symbol, ...arr])];
-          setWatchlist(restored);
-        }
-      }
-    } catch { /* noop */ }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  // 价格精度（从 Bitget 拿），用于动态设置 K 线小数位
+  const [pricePlace, setPricePlace] = useState<number>(2);
 
-  // 列表变化时自动保存
-  useEffect(() => {
-    localStorage.setItem("tvbt-watchlist-v1", JSON.stringify(watchlist));
-  }, [watchlist]);
-
+  // —— 初始化：图表搭建 ——
   useEffect(() => {
     let cleanup: (() => void) | undefined;
 
     (async () => {
       try {
-        // 等图表脚本
         await waitFor(() => !!window.LightweightCharts?.createChart, 8000, 50);
         if (!priceRef.current || !equityRef.current) return;
 
@@ -108,7 +96,9 @@ export default function Home() {
         const candle = priceChart.addCandlestickSeries();
         const sma = priceChart.addLineSeries({ lineWidth: 1 });
         const ema = priceChart.addLineSeries({ lineWidth: 1 });
-        candleRef.current = candle; smaRef.current = sma; emaRef.current = ema;
+        candleRef.current = candle;
+        smaRef.current = sma;
+        emaRef.current = ema;
 
         // 资金曲线图
         const equityChart = createChart(equityRef.current, {
@@ -124,7 +114,7 @@ export default function Home() {
         const equityLine = equityChart.addLineSeries({ lineWidth: 2 });
         equitySeriesRef.current = equityLine;
 
-        // 两个图表宽度自适应
+        // 宽度自适应
         const onResize = () => {
           if (!priceRef.current || !equityRef.current) return;
           priceChart.applyOptions({ width: priceRef.current.clientWidth });
@@ -132,7 +122,7 @@ export default function Home() {
         };
         window.addEventListener("resize", onResize);
 
-        // 简单同步时间轴可视范围（从价格图同步到资金曲线）
+        // 时间轴可视范围同步
         priceChart.timeScale().subscribeVisibleLogicalRangeChange((range: any) => {
           try {
             equityChart.timeScale().setVisibleLogicalRange(range);
@@ -145,8 +135,12 @@ export default function Home() {
           equityChart.remove();
         };
 
-        // 首次加载
-        await loadData(symbol, interval, bars);
+        // 初次：加载 contracts 列表 & 精度 & K线
+        await Promise.all([
+          loadPerps(),      // 加载交易中永续合约列表
+          loadPrecision(symbol), // 拉一次初始 symbol 的精度，设置价格小数位
+          loadData(symbol, interval, bars), // 拉 K 线
+        ]);
       } catch (e: any) {
         setErrorMsg(e?.message ?? String(e));
       } finally {
@@ -158,7 +152,7 @@ export default function Home() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // 切换品种/周期/数量重新拉数据
+  // —— 切换 symbol/interval/bars：重新拉 K线 ——
   useEffect(() => {
     if (!priceChartRef.current) return;
     setLoading(true);
@@ -166,12 +160,65 @@ export default function Home() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [symbol, interval, bars]);
 
-  // 指标周期变化时，仅重算指标
+  // —— 切换指标周期：只重算指标 ——
   useEffect(() => {
     if (!dataRef.current.length) return;
     applyIndicators(dataRef.current, smaLen, emaLen, smaRef.current, emaRef.current);
   }, [smaLen, emaLen]);
 
+  // —— 切换 symbol：自动刷新精度（影响价格小数位） ——
+  useEffect(() => {
+    loadPrecision(symbol).catch(err => console.warn("precision load failed:", err));
+  }, [symbol]);
+
+  // 从后端取：Bitget 永续合约列表（只保留 trading）
+  async function loadPerps() {
+    try {
+      const r = await fetch("/api/bitget/perps", { cache: "no-store" });
+      const j = await r.json();
+      if (Array.isArray(j?.symbols)) {
+        const list: string[] = j.symbols;
+        setAllPerps(list.includes(symbol) ? list : [symbol, ...list]);
+      }
+    } catch (e) {
+      console.warn("load perps failed", e);
+    }
+    // 恢复收藏
+    try {
+      const raw = localStorage.getItem("tvbt-favs-v1");
+      if (raw) {
+        const arr = JSON.parse(raw);
+        if (Array.isArray(arr) && arr.every((s) => typeof s === "string")) {
+          setFavs(arr);
+        }
+      }
+    } catch {}
+  }
+
+  // 从后端取：单个合约精度（pricePlace），并应用到蜡烛序列
+  async function loadPrecision(sym: string) {
+    try {
+      const r = await fetch(`/api/bitget/contract?symbol=${encodeURIComponent(sym)}`, { cache: "no-store" });
+      if (!r.ok) throw new Error(await r.text());
+      const j = await r.json();
+      const pp = Number(j?.pricePlace);
+      if (Number.isFinite(pp) && candleRef.current) {
+        setPricePlace(pp);
+        candleRef.current.applyOptions({
+          priceFormat: {
+            type: "price",
+            precision: pp,
+            minMove: Math.pow(10, -pp),
+          },
+        });
+      }
+    } catch (e) {
+      // 拉不到就维持默认 2 位；不中断流程
+      console.warn("load contract precision failed:", e);
+    }
+  }
+
+  // 拉 K 线
   async function loadData(sym: string, itv: string, n: number) {
     try {
       setErrorMsg("");
@@ -183,79 +230,74 @@ export default function Home() {
 
       dataRef.current = arr;
 
-      // 设置K线
+      // 设 K 线
       candleRef.current.setData(
-        arr.map(d => ({ time: d.time as any, open: d.open, high: d.high, low: d.low, close: d.close }))
+        arr.map((d) => ({ time: d.time as any, open: d.open, high: d.high, low: d.low, close: d.close }))
       );
       priceChartRef.current.timeScale().fitContent();
 
-      // 叠加指标
+      // 指标
       applyIndicators(arr, smaLen, emaLen, smaRef.current, emaRef.current);
 
-      // 清空旧的资金曲线（避免残影）
+      // 清空旧资金曲线
       equitySeriesRef.current.setData([]);
       equityDataRef.current = [];
+      setBtStats(null);
+      setBtTrades([]);
     } catch (e: any) {
       setErrorMsg(e?.message ?? String(e));
       console.error(e);
     }
   }
 
+  // 回测：双 EMA 交叉
   function runBacktest() {
     const arr = dataRef.current;
     if (!arr.length) return;
 
-    // 策略用 EMA（你也可以改成 SMA）
-    const closes = arr.map(d => ({ close: d.close }));
+    const closes = arr.map((d) => ({ close: d.close }));
     const f = EMA(closes, fastLen);
     const s = EMA(closes, slowLen);
 
     const { stats, trades, markers, equityCurve } = backtestDualEMA(arr, f, s, {
-      feeBps, slippageBps: slipBps,
+      feeBps,
+      slippageBps: slipBps,
     });
 
     setBtStats(stats);
     setBtTrades(trades);
-    equityDataRef.current = equityCurve; // 存起来用于导出
+    equityDataRef.current = equityCurve;
 
-    // 在价格图上打点
     candleRef.current.setMarkers(markers);
-
-    // 在下方图显示资金曲线（value=1 起步）
     equitySeriesRef.current.setData(
-      equityCurve.map(pt => ({ time: pt.time as any, value: pt.value }))
+      equityCurve.map((pt) => ({ time: pt.time as any, value: pt.value }))
     );
 
-    // 让资金曲线可视范围跟价格图一致
     try {
       const r = priceChartRef.current.timeScale().getVisibleLogicalRange();
       equityChartRef.current.timeScale().setVisibleLogicalRange(r);
     } catch { /* noop */ }
-  } // runBacktest 结束
+  }
 
-  // ===== Watchlist 操作 =====
-  function addToWatchlist() {
-    const s = newSymbol.trim().toUpperCase();
-    if (!s) return;
-    if (!/^[A-Z0-9]+$/.test(s)) {
-      alert("只支持字母数字组合的交易对，比如 BTCUSDT");
-      return;
+  // 收藏操作
+  function starCurrentSymbol() {
+    if (!symbol) return;
+    setFavs((prev) => (prev.includes(symbol) ? prev : [symbol, ...prev]));
+    try {
+      const next = JSON.stringify([symbol, ...favs.filter(s => s !== symbol)]);
+      localStorage.setItem("tvbt-favs-v1", next);
+    } catch {}
+  }
+  function removeFav(sym: string) {
+    setFavs((prev) => prev.filter((s) => s !== sym));
+    try {
+      const next = favs.filter((s) => s !== sym);
+      localStorage.setItem("tvbt-favs-v1", JSON.stringify(next));
+    } catch {}
+    if (symbol === sym && favs.length > 1) {
+      const next = favs.find((s) => s !== sym);
+      if (next) setSymbol(next);
     }
-    setWatchlist(prev => [...new Set([s, ...prev])]);
-    setNewSymbol("");
-  }
-
-  function removeFromWatchlist(sym: string) {
-    setWatchlist(prev => {
-      const filtered = prev.filter(x => x !== sym);
-      // 如果删掉的是当前 symbol，切换到剩余列表的第一个（若有）
-      if (symbol === sym && filtered.length > 0) setSymbol(filtered[0]);
-      return filtered;
-    });
-  }
-
-  function selectFromWatchlist(sym: string) {
-    setSymbol(sym);
   }
 
   // 导出：交易明细
@@ -265,15 +307,15 @@ export default function Home() {
       return;
     }
     const headers = ["entryTime","exitTime","entryPrice","exitPrice","side","pnlPct"];
-    const rows = btTrades.map(t => [
+    const rows = btTrades.map((t) => [
       new Date(t.entryTime * 1000).toISOString(),
       new Date(t.exitTime * 1000).toISOString(),
-      t.entryPrice.toFixed(6),
-      t.exitPrice.toFixed(6),
+      t.entryPrice.toFixed(pricePlace),
+      t.exitPrice.toFixed(pricePlace),
       t.side,
-      (t.pnlPct * 100).toFixed(4) + "%"
+      (t.pnlPct * 100).toFixed(4) + "%",
     ]);
-    const csv = [headers.join(","), ...rows.map(r => r.join(","))].join("\n");
+    const csv = [headers.join(","), ...rows.map((r) => r.join(","))].join("\n");
     const blob = new Blob([csv], { type: "text/csv;charset=utf-8;" });
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
@@ -291,11 +333,11 @@ export default function Home() {
       return;
     }
     const headers = ["time","value"];
-    const rows = data.map(pt => [
+    const rows = data.map((pt) => [
       new Date(pt.time * 1000).toISOString(),
       pt.value.toFixed(6),
     ]);
-    const csv = [headers.join(","), ...rows.map(r => r.join(","))].join("\n");
+    const csv = [headers.join(","), ...rows.map((r) => r.join(","))].join("\n");
     const blob = new Blob([csv], { type: "text/csv;charset=utf-8;" });
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
@@ -313,30 +355,46 @@ export default function Home() {
       />
 
       <h1 style={{ fontSize: 20, fontWeight: 700, marginBottom: 12 }}>
-        小傻瓜量化 · Bitget 实盘K线 + MA/EMA + 回测 + 资金曲线
+        小傻瓜量化 · Bitget 实盘K线 + 指标 + 回测 + 资金曲线
       </h1>
 
-      {/* 自选列表条 */}
-      <div style={{
-        display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap",
-        padding: "8px 0", marginBottom: 8, borderBottom: "1px dashed #eee"
-      }}>
-        <label style={{ fontWeight: 600 }}>自选：</label>
-        <input
-          value={newSymbol}
-          onChange={e => setNewSymbol(e.target.value.toUpperCase())}
-          onKeyDown={e => { if (e.key === "Enter") addToWatchlist(); }}
-          placeholder="如：BTCUSDT"
-          style={{ width: 140, height: 28, padding: "0 8px" }}
-        />
-        <button onClick={addToWatchlist} style={{ padding: "6px 10px" }}>添加</button>
+      {/* 交易对下拉 + 收藏 + 快捷周期条 */}
+      <div
+        style={{
+          display: "flex",
+          gap: 10,
+          alignItems: "center",
+          flexWrap: "wrap",
+          padding: "8px 0",
+          marginBottom: 8,
+          borderBottom: "1px dashed #eee",
+        }}
+      >
+        <label style={{ fontWeight: 600 }}>交易对：</label>
+        <select
+          value={symbol}
+          onChange={(e) => setSymbol(e.target.value)}
+          style={{ minWidth: 200, height: 32 }}
+        >
+          {allPerps.length === 0 ? (
+            <option value={symbol}>{symbol}（加载中…）</option>
+          ) : (
+            allPerps.map((s) => (
+              <option key={s} value={s}>{s}</option>
+            ))
+          )}
+        </select>
 
-        {/* 自选标签列表 */}
+        <button onClick={starCurrentSymbol} title="收藏当前交易对" style={{ padding: "6px 10px" }}>
+          ⭐ 收藏
+        </button>
+
+        {/* 收藏列表 */}
         <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
-          {watchlist.map((sym) => (
+          {favs.map((sym) => (
             <div
               key={sym}
-              onClick={() => selectFromWatchlist(sym)}
+              onClick={() => setSymbol(sym)}
               title="点击切换"
               style={{
                 display: "inline-flex",
@@ -347,18 +405,18 @@ export default function Home() {
                 border: "1px solid #ddd",
                 cursor: "pointer",
                 background: sym === symbol ? "#eef6ff" : "#fafafa",
-                fontWeight: sym === symbol ? 700 : 400
+                fontWeight: sym === symbol ? 700 : 400,
               }}
             >
               <span>{sym}{sym === symbol ? " ⭐" : ""}</span>
               <span
-                title="移出自选"
-                onClick={(e) => { e.stopPropagation(); removeFromWatchlist(sym); }}
+                title="移出收藏"
+                onClick={(e) => { e.stopPropagation(); removeFav(sym); }}
                 style={{
                   display: "inline-flex",
                   width: 16, height: 16, borderRadius: 999,
                   alignItems: "center", justifyContent: "center",
-                  border: "1px solid #ddd", fontSize: 12, lineHeight: "14px", marginLeft: 4
+                  border: "1px solid #ddd", fontSize: 12, lineHeight: "14px",
                 }}
               >
                 ×
@@ -366,35 +424,58 @@ export default function Home() {
             </div>
           ))}
         </div>
+
+        {/* 快捷周期条 */}
+        <div style={{ display: "flex", gap: 6, alignItems: "center", marginLeft: "auto" }}>
+          <span style={{ color: "#666" }}>周期：</span>
+          {QUICK_INTERVALS.map((itv) => (
+            <button
+              key={itv}
+              onClick={() => setInterval(itv)}
+              style={{
+                padding: "4px 8px",
+                borderRadius: 8,
+                border: "1px solid #ddd",
+                background: interval === itv ? "#eef6ff" : "#fff",
+                fontWeight: interval === itv ? 700 : 400,
+                cursor: "pointer",
+              }}
+              title={`切换到 ${itv}`}
+            >
+              {itv}
+            </button>
+          ))}
+        </div>
       </div>
 
       {/* 行情/指标控制区 */}
       <div style={{ display: "flex", gap: 12, alignItems: "center", flexWrap: "wrap", marginBottom: 12 }}>
-        <label>Symbol</label>
-        <input value={symbol} onChange={e => setSymbol(e.target.value.toUpperCase())} style={{ width: 120 }} />
-        <label>Interval</label>
-        <select value={interval} onChange={e => setInterval(e.target.value as Interval)}>
-          {["1m","3m","5m","15m","30m","1H","4H","6H","12H","1D","3D","1W","1M"].map(x =>
-            <option key={x} value={x}>{x}</option>
-          )}
-        </select>
         <label>Bars</label>
         <input
-          type="number" min={1} max={200} value={bars}
-          onChange={e => setBars(Math.min(Math.max(Number(e.target.value) || 200, 1), 200))}
+          type="number"
+          min={1}
+          max={200}
+          value={bars}
+          onChange={(e) => setBars(Math.min(Math.max(Number(e.target.value) || 200, 1), 200))}
           style={{ width: 80 }}
         />
         <span style={{ width: 16 }} />
         <label>MA</label>
         <input
-          type="number" min={2} max={500} value={smaLen}
-          onChange={e => setSmaLen(Math.max(2, Number(e.target.value) || 20))}
+          type="number"
+          min={2}
+          max={500}
+          value={smaLen}
+          onChange={(e) => setSmaLen(Math.max(2, Number(e.target.value) || 20))}
           style={{ width: 70 }}
         />
         <label>EMA</label>
         <input
-          type="number" min={2} max={500} value={emaLen}
-          onChange={e => setEmaLen(Math.max(2, Number(e.target.value) || 50))}
+          type="number"
+          min={2}
+          max={500}
+          value={emaLen}
+          onChange={(e) => setEmaLen(Math.max(2, Number(e.target.value) || 50))}
           style={{ width: 70 }}
         />
         <span style={{ color: "#666" }}>{loading ? "加载中…" : errorMsg ? `❌ ${errorMsg}` : "✅ 就绪"}</span>
@@ -406,25 +487,25 @@ export default function Home() {
         <label>Fast</label>
         <input
           type="number" min={2} max={200} value={fastLen}
-          onChange={e => setFastLen(Math.max(2, Number(e.target.value) || 20))}
+          onChange={(e) => setFastLen(Math.max(2, Number(e.target.value) || 20))}
           style={{ width: 70 }}
         />
         <label>Slow</label>
         <input
           type="number" min={3} max={500} value={slowLen}
-          onChange={e => setSlowLen(Math.max(3, Number(e.target.value) || 50))}
+          onChange={(e) => setSlowLen(Math.max(3, Number(e.target.value) || 50))}
           style={{ width: 70 }}
         />
         <label>Fee(bps)</label>
         <input
           type="number" min={0} max={50} value={feeBps}
-          onChange={e => setFeeBps(Math.max(0, Number(e.target.value) || 6))}
+          onChange={(e) => setFeeBps(Math.max(0, Number(e.target.value) || 6))}
           style={{ width: 70 }}
         />
         <label>Slip(bps)</label>
         <input
           type="number" min={0} max={50} value={slipBps}
-          onChange={e => setSlipBps(Math.max(0, Number(e.target.value) || 5))}
+          onChange={(e) => setSlipBps(Math.max(0, Number(e.target.value) || 5))}
           style={{ width: 70 }}
         />
         <button onClick={runBacktest} style={{ padding: "6px 10px" }}>运行回测</button>
@@ -463,7 +544,7 @@ export default function Home() {
               {btTrades.slice(-5).map((t, i) => (
                 <li key={i} style={{ fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace" }}>
                   {new Date(t.entryTime * 1000).toISOString()} → {new Date(t.exitTime * 1000).toISOString()} |
-                  入:{t.entryPrice.toFixed(2)} 出:{t.exitPrice.toFixed(2)} |
+                  入:{t.entryPrice.toFixed(pricePlace)} 出:{t.exitPrice.toFixed(pricePlace)} |
                   PnL:{(t.pnlPct * 100).toFixed(2)}%
                 </li>
               ))}
@@ -475,11 +556,12 @@ export default function Home() {
   );
 }
 
+// —— 指标叠加 ——
 function applyIndicators(arr: Candle[], sLen: number, eLen: number, smaSeries: any, emaSeries: any) {
-  const closes = arr.map(d => ({ close: d.close }));
+  const closes = arr.map((d) => ({ close: d.close }));
   const smaArr = SMA(closes, sLen);
   const emaArr = EMA(closes, eLen);
-  const times = arr.map(d => d.time as any);
+  const times = arr.map((d) => d.time as any);
 
   smaSeries.setData(
     smaArr.map((v, i) => (Number.isFinite(v) ? { time: times[i], value: v } : null)).filter(Boolean)
@@ -489,12 +571,12 @@ function applyIndicators(arr: Candle[], sLen: number, eLen: number, smaSeries: a
   );
 }
 
-// 等待条件成立（等待脚本加载完成）
+// —— 等待脚本加载 ——
 async function waitFor(cond: () => boolean, timeoutMs = 3000, intervalMs = 50) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     if (cond()) return;
-    await new Promise(r => setTimeout(r, intervalMs));
+    await new Promise((r) => setTimeout(r, intervalMs));
   }
   throw new Error("LightweightCharts script failed to load in time");
 }

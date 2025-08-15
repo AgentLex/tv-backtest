@@ -21,6 +21,12 @@ type Interval =
   | "1H" | "4H" | "6H" | "12H"
   | "1D" | "3D" | "1W" | "1M";
 
+const ALL_INTERVALS: Interval[] = [
+  "1m","3m","5m","15m","30m",
+  "1H","4H","6H","12H",
+  "1D","3D","1W","1M",
+];
+
 const QUICK_INTERVALS: Interval[] = ["1m", "15m", "1H", "4H", "1D"];
 
 export default function Home() {
@@ -137,9 +143,9 @@ export default function Home() {
 
         // 初次：加载 contracts 列表 & 精度 & K线
         await Promise.all([
-          loadPerps(),      // 加载交易中永续合约列表
-          loadPrecision(symbol), // 拉一次初始 symbol 的精度，设置价格小数位
-          loadData(symbol, interval, bars), // 拉 K 线
+          loadPerps(),           // 交易中永续合约列表
+          loadPrecision(symbol), // 初始 symbol 精度
+          loadData(symbol, interval, bars), // 初始 K 线
         ]);
       } catch (e: any) {
         setErrorMsg(e?.message ?? String(e));
@@ -171,7 +177,7 @@ export default function Home() {
     loadPrecision(symbol).catch(err => console.warn("precision load failed:", err));
   }, [symbol]);
 
-  // 从后端取：Bitget 永续合约列表（只保留 trading）
+  // 从后端取：Bitget 永续合约列表（只保留 normal/listed）
   async function loadPerps() {
     try {
       const r = await fetch("/api/bitget/perps", { cache: "no-store" });
@@ -450,6 +456,15 @@ export default function Home() {
 
       {/* 行情/指标控制区 */}
       <div style={{ display: "flex", gap: 12, alignItems: "center", flexWrap: "wrap", marginBottom: 12 }}>
+        <label>Interval</label>
+        <select
+          value={interval}
+          onChange={(e) => setInterval(e.target.value as Interval)}
+          style={{ height: 32 }}
+        >
+          {ALL_INTERVALS.map(x => <option key={x} value={x}>{x}</option>)}
+        </select>
+
         <label>Bars</label>
         <input
           type="number"

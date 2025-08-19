@@ -1,170 +1,101 @@
-// src/app/api/candles/route.ts
 import { NextResponse } from "next/server";
-import { z } from "zod";
 
-// 统一的蜡烛类型（秒级时间戳）
-type Candle = {
-  time: number; // unix seconds
-  open: number;
-  high: number;
-  low: number;
-  close: number;
-  volume?: number;
-};
+// 允许的周期，直接与 Bitget v2 文档对齐
+const ALLOWED = new Set([
+  "1m","3m","5m","15m","30m",
+  "1H","4H","6H","12H",
+  "1D","3D","1W","1M",
+  "6Hutc","12Hutc","1Dutc","3Dutc","1Wutc","1Mutc",
+]);
 
-// 入参校验
-const querySchema = z.object({
-  symbol: z.string().min(1),
-  interval: z.enum(["1m","3m","5m","15m","30m","1H","4H","6H","12H","1D","3D","1W","1M"]),
-  bars: z.coerce.number().int().min(1).max(200),
-});
-
-// Bitget 粒度映射（单位：秒）
-const BG_INTERVAL_TO_SEC: Record<string, number> = {
-  "1m": 60,
-  "3m": 3 * 60,
-  "5m": 5 * 60,
-  "15m": 15 * 60,
-  "30m": 30 * 60,
-  "1H": 60 * 60,
-  "4H": 4 * 60 * 60,
-  "6H": 6 * 60 * 60,
-  "12H": 12 * 60 * 60,
-  "1D": 24 * 60 * 60,
-  "3D": 3 * 24 * 60 * 60,
-  "1W": 7 * 24 * 60 * 60,
-  "1M": 30 * 24 * 60 * 60, // 近似
-};
-
-// Bitget granularity（单位：秒），文档要求传“秒”
-function bgGranularity(interval: string): number {
-  return BG_INTERVAL_TO_SEC[interval] ?? 60;
-}
+// 若你未来要切 COIN 本位或 USDC 本位，只改这里
+const DEFAULT_PRODUCT_TYPE = "USDT-FUTURES"; // 其它：COIN-FUTURES / USDC-FUTURES
 
 export async function GET(req: Request) {
   try {
     const { searchParams } = new URL(req.url);
-    const parsed = querySchema.safeParse({
-      symbol: searchParams.get("symbol") ?? undefined,
-      interval: searchParams.get("interval") ?? undefined,
-      bars: searchParams.get("bars") ?? undefined,
+    const symbol = (searchParams.get("symbol") || "").toUpperCase().trim(); // 例：BTCUSDT
+    const interval = (searchParams.get("interval") || "1H").trim();         // 例：1H
+    const bars = Math.max(1, Math.min(200, Number(searchParams.get("bars")) || 200));
+
+    if (!symbol) {
+      return NextResponse.json({ error: "Missing symbol" }, { status: 400 });
+    }
+    if (!ALLOWED.has(interval)) {
+      return NextResponse.json({
+        error: `interval must be one of: ${Array.from(ALLOWED).join(", ")}`
+      }, { status: 400 });
+    }
+
+    // 直接用 limit 拉最近 N 根，不传 start/end，避免 Bitget 时间校验 400
+    const qs = new URLSearchParams({
+      symbol,
+      productType: DEFAULT_PRODUCT_TYPE,
+      granularity: interval,
+      limit: String(bars),
     });
 
-    if (!parsed.success) {
-      return NextResponse.json({ error: parsed.error.flatten() }, { status: 400 });
-    }
+    const url = `https://api.bitget.com/api/v2/mix/market/history-candles?${qs.toString()}`;
 
-    const { symbol, interval, bars } = parsed.data;
+    const r = await fetch(url, {
+      // 防止 CDN 复用 & 跨时区缓存
+      cache: "no-store",
+      // Bitget 不要求 UA，但带上有助于排查
+      headers: { "User-Agent": "tv-backtest/1.0 (+nextjs)" },
+      // 10 秒超时
+      signal: AbortSignal.timeout(10000),
+    });
 
-    // 计算时间窗（Bitget 需要 startTime / endTime，单位 ms）
-    const nowSec = Math.floor(Date.now() / 1000);
-    const stepSec = bgGranularity(interval);
-    const lookbackSec = stepSec * (bars + 2); // 多取两根，避免边界
-    const startMs = (nowSec - lookbackSec) * 1000;
-    const endMs = nowSec * 1000;
-
-    // Bitget 永续市场：/api/mix/v1/market/candles
-    // 说明：某些场景返回顺序是从新到旧；我们会统一排序。
-    const url = new URL("https://api.bitget.com/api/mix/v1/market/candles");
-    url.searchParams.set("symbol", symbol);
-    url.searchParams.set("granularity", String(stepSec)); // 秒
-    url.searchParams.set("startTime", String(startMs));
-    url.searchParams.set("endTime", String(endMs));
-
-    const r = await fetch(url.toString(), { cache: "no-store" });
     if (!r.ok) {
-      const txt = await r.text();
-      return NextResponse.json({ error: `Bitget ${r.status}: ${txt}` }, { status: 400 });
+      const text = await r.text();
+      return NextResponse.json({ error: `Bitget ${r.status}: ${text}` }, { status: r.status });
     }
 
-    const j = await r.json().catch(() => ({} as any));
+    type RawItem = [string,string,string,string,string,string,string]; // [ts, open, high, low, close, baseVol, quoteVol]
+    type RawResp = { code: string; msg: string; data?: RawItem[]; requestTime?: number };
 
-    // 兼容两种可能结构：
-    // 1) data: string[][]
-    //    每行示例（官方可能调整顺序，这里尽量兼容）：[
-    //      "1717056000000","open","high","low","close","volume","quoteVolume" ...
-    //    ]
-    // 2) data: { openTime, open, high, low, close, baseVol }[]
-    const raw: any[] = Array.isArray(j?.data) ? j.data : [];
+    const j: RawResp = await r.json();
 
-    const out: Candle[] = [];
-    for (const row of raw) {
-      let openTsMs: number | undefined;
-      let open: number | undefined;
-      let high: number | undefined;
-      let low: number | undefined;
-      let close: number | undefined;
-      let vol: number | undefined;
+    if (j.code !== "00000" || !Array.isArray(j.data) || j.data.length === 0) {
+      return NextResponse.json({ error: "Empty candles" }, { status: 400 });
+    }
 
-      if (Array.isArray(row)) {
-        // 尝试解析数组格式（多数返回是这种）
-        // 保险起见，先把能转数字的都转一下
-        const t0 = Number(row[0]);
-        const o0 = Number(row[1]);
-        const h0 = Number(row[2]);
-        const l0 = Number(row[3]);
-        const c0 = Number(row[4]);
-        const v0 = Number(row[5]);
+    // Bitget 返回「从旧到新」或「从新到旧」在不同环境可能不一致，这里统一按时间升序输出
+    const rows = j.data
+      .map((it) => {
+        const [openTsMs, open, high, low, close, baseVol] = it;
+        const tsNum = Number(openTsMs);
+        const o = Number(open), h = Number(high), l = Number(low), c = Number(close);
+        const v = Number(baseVol);
+        if (!Number.isFinite(tsNum) || !Number.isFinite(o) || !Number.isFinite(h) || !Number.isFinite(l) || !Number.isFinite(c)) {
+          return null;
+        }
+        return {
+          time: Math.floor(tsNum / 1000), // 前端用秒
+          open: o,
+          high: h,
+          low: l,
+          close: c,
+          volume: Number.isFinite(v) ? v : undefined,
+        };
+      })
+      .filter(Boolean) as Array<{time:number;open:number;high:number;low:number;close:number;volume?:number}>;
 
-        openTsMs = Number.isFinite(t0) ? t0 : undefined;
-        open = Number.isFinite(o0) ? o0 : undefined;
-        high = Number.isFinite(h0) ? h0 : undefined;
-        low = Number.isFinite(l0) ? l0 : undefined;
-        close = Number.isFinite(c0) ? c0 : undefined;
-        vol = Number.isFinite(v0) ? v0 : undefined;
-      } else if (row && typeof row === "object") {
-        // 尝试解析对象格式
-        const t0 = Number((row.openTime ?? row.t ?? row.ts));
-        const o0 = Number(row.open);
-        const h0 = Number(row.high);
-        const l0 = Number(row.low);
-        const c0 = Number(row.close);
-        const v0 = Number(row.baseVol ?? row.volume ?? row.v);
+    if (rows.length === 0) {
+      return NextResponse.json({ error: "Empty candles" }, { status: 400 });
+    }
 
-        openTsMs = Number.isFinite(t0) ? t0 : undefined;
-        open = Number.isFinite(o0) ? o0 : undefined;
-        high = Number.isFinite(h0) ? h0 : undefined;
-        low = Number.isFinite(l0) ? l0 : undefined;
-        close = Number.isFinite(c0) ? c0 : undefined;
-        vol = Number.isFinite(v0) ? v0 : undefined;
+    // 按时间升序
+    rows.sort((a, b) => a.time - b.time);
+
+    return NextResponse.json(rows, {
+      headers: {
+        "Cache-Control": "no-store, no-cache, must-revalidate",
       }
-
-      // 关键字段不能为空，否则跳过该行，避免 TS 报 “possibly undefined”
-      if (
-        openTsMs == null ||
-        open == null ||
-        high == null ||
-        low == null ||
-        close == null
-      ) {
-        continue;
-      }
-
-      out.push({
-        time: Math.floor(openTsMs / 1000), // 统一用秒
-        open,
-        high,
-        low,
-        close,
-        volume: vol,
-      });
-    }
-
-    // Bitget 返回通常是“新到旧”，我们统一按时间升序
-    out.sort((a, b) => a.time - b.time);
-
-    // 只取最后 bars 根（如果返回多了）
-    const trimmed = out.slice(-bars);
-
-    if (trimmed.length === 0) {
-      return NextResponse.json({ error: "Empty candles from Bitget" }, { status: 400 });
-    }
-
-    return NextResponse.json(trimmed);
+    });
   } catch (e: any) {
-    return NextResponse.json(
-      { error: e?.message ?? String(e) },
-      { status: 500 },
-    );
+    const msg = e?.message || String(e);
+    // Body has already been read / timeout 等也兜底
+    return NextResponse.json({ error: msg }, { status: 500 });
   }
 }

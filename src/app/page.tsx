@@ -111,7 +111,7 @@ function Home() {
   // —— AI 聊天 —— //
   type ChatMsg = { role: "user" | "assistant"; content: string };
   const [chatMsgs, setChatMsgs] = useState<ChatMsg[]>([
-    { role: "assistant", content: "你好，我是小傻瓜 AI，关于策略/回测/指标随便问～（非管理员每 IP 每天限额）" },
+    { role: "assistant", content: "小金手你好，由于本站链接了ChatGPT，因此我就是你的小金手 AI，关于策略/回测/指标随便问～（当前调试阶段，每人每天限额5条）" },
   ]);
   const [chatInput, setChatInput] = useState("");
   const [chatSending, setChatSending] = useState(false);
@@ -592,7 +592,7 @@ function Home() {
       {/* 顶栏：标题 + 登录 */}
       <div style={{ display: "flex", alignItems: "center", marginBottom: 12 }}>
         <h1 style={{ fontSize: 20, fontWeight: 700, margin: 0 }}>
-          小傻瓜量化 · Bitget 实盘K线 + 指标 + 回测 + 资金曲线 + AI
+          小金手量化 · Bitget 实盘K线 + 指标 + 回测 + 资金曲线 + AI
         </h1>
         <div style={{ marginLeft: "auto", display: "flex", alignItems: "center", gap: 8 }}>
           {status === "loading" ? (

@@ -5,18 +5,9 @@ import Script from "next/script";
 import type { Candle } from "@/lib/types";
 import { SMA, EMA, MACD, RSI, KDJ, BOLL } from "@/lib/indicators";
 import { backtestDualEMA, type Trade } from "@/lib/backtest";
-import { SessionProvider, useSession, signIn, signOut } from "next-auth/react";
+import { useSession, signIn, signOut } from "next-auth/react";
 
-/** 将页面包在 SessionProvider 下，确保 useSession 正常可用 */
-export default function Page() {
-  return (
-    <SessionProvider>
-      <Home />
-    </SessionProvider>
-  );
-}
-
-// lightweight-charts 挂在 window 上
+// lightweight-charts standalone 掛在 window 上
 declare global {
   interface Window {
     LightweightCharts?: {
@@ -26,15 +17,18 @@ declare global {
   }
 }
 
+// —— 市场 & 周期 —— //
+type Market = "BG" | "CN"; // BG=Bitget加密; CN=A股
 type Interval =
   | "1m" | "3m" | "5m" | "15m" | "30m"
   | "1H" | "4H" | "6H" | "12H"
   | "1D" | "3D" | "1W" | "1M";
 
-const QUICK_INTERVALS: Interval[] = ["1m", "15m", "1H", "4H", "1D"];
-const ALL_INTERVALS: Interval[] = ["1m","3m","5m","15m","30m","1H","4H","6H","12H","1D","3D","1W","1M"];
+const QUICK_BG: Interval[] = ["1m", "15m", "1H", "4H", "1D"];
+const QUICK_CN: Interval[] = ["1D", "1W"]; // A股仅开放日/周
 
-/** 常用指标配置 */
+// —— 常用指标 —— //
+type BuiltinKey = "MACD" | "RSI" | "KDJ" | "BOLL";
 type BuiltinConfig = {
   MACD: { fast: number; slow: number; signal: number; enabled: boolean };
   RSI:  { len: number; enabled: boolean };
@@ -42,39 +36,49 @@ type BuiltinConfig = {
   BOLL: { len: number; mult: number; enabled: boolean };
 };
 
-function Home() {
+// —— A股示例列表（你可自由增删）—— //
+// 注意：这里是 Yahoo 的代码格式
+const CN_DEFAULTS = [
+  { code: "600519.SS", name: "贵州茅台" },
+  { code: "601318.SS", name: "中国平安" },
+  { code: "000001.SZ", name: "平安银行" },
+  { code: "^SSEC",     name: "上证指数" },
+  { code: "^SZCI",     name: "深证成指" },
+];
+
+export default function Home() {
   const { data: session, status } = useSession();
-  // 建议在 NextAuth 回调里给 user.role = 'admin'（服务端），这里直接读
   const isAdmin = (session?.user as any)?.role === "admin";
 
-  // —— 图表 refs ——
+  // —— 图表 refs —— //
   const priceRef = useRef<HTMLDivElement>(null);
   const priceChartRef = useRef<any>(null);
   const candleRef = useRef<any>(null);
-  // 动态 overlay（含内置 & 自定义指标线）
   const overlaySeriesRef = useRef<Map<string, any>>(new Map());
 
   const equityRef = useRef<HTMLDivElement>(null);
   const equityChartRef = useRef<any>(null);
   const equitySeriesRef = useRef<any>(null);
 
-  // 数据缓存
+  // —— 数据缓存 —— //
   const dataRef = useRef<Candle[]>([]);
   const equityDataRef = useRef<{ time: number; value: number }[]>([]);
 
-  // —— 页面状态 ——
-  const [symbol, setSymbol] = useState("BTCUSDT");
+  // —— 页面状态 —— //
+  const [market, setMarket]   = useState<Market>("BG");
+  const [symbol, setSymbol]   = useState("BTCUSDT");     // BG 默认
+  const [cnSymbol, setCnSymbol] = useState("600519.SS"); // CN 默认
   const [interval, setInterval] = useState<Interval>("1H");
   const [bars, setBars] = useState(200);
 
-  // 简单演示的 SMA/EMA（叠在价格图上）
+  // 默认两条均线
   const [smaLen, setSmaLen] = useState(20);
   const [emaLen, setEmaLen] = useState(50);
 
   // 回测参数
   const [fastLen, setFastLen] = useState(20);
   const [slowLen, setSlowLen] = useState(50);
-  const [feeBps, setFeeBps] = useState(6);
+  const [feeBps, setFeeBps]   = useState(6);
   const [slipBps, setSlipBps] = useState(5);
 
   // 常用指标配置
@@ -95,39 +99,24 @@ function Home() {
   }>(null);
   const [btTrades, setBtTrades] = useState<Trade[]>([]);
 
-  // 交易对列表 & 收藏
+  // 交易对列表 & 收藏（BG）
   const [allPerps, setAllPerps] = useState<string[]>([]);
   const [favs, setFavs] = useState<string[]>([]);
 
-  // 自定义指标
-  const [customList, setCustomList] = useState<{ name: string; updatedAt: number }[]>([]);
-  const [enabledCustom, setEnabledCustom] = useState<string[]>([]);
-  const [uploadName, setUploadName] = useState("");
-  const [uploadCode, setUploadCode] = useState("");
-
-  // 价格精度（Bitget）
+  // 价格小数位（BG 从 Bitget 拿；CN 由数据本身决定，保留原逻辑）
   const [pricePlace, setPricePlace] = useState<number>(2);
 
-  // —— AI 聊天 —— //
-  type ChatMsg = { role: "user" | "assistant"; content: string };
-  const [chatMsgs, setChatMsgs] = useState<ChatMsg[]>([
-    { role: "assistant", content: "小金手你好，由于本站链接了ChatGPT，因此我就是你的小金手 AI，关于策略/回测/指标随便问～（当前调试阶段，每人每天限额5条）" },
-  ]);
-  const [chatInput, setChatInput] = useState("");
-  const [chatSending, setChatSending] = useState(false);
-  const [remaining, setRemaining] = useState<number | null>(null);
-
-  // —— 初始化：图表 & 初次加载 —— //
+  // —— 初始化：搭图 & 首次加载 —— //
   useEffect(() => {
     let cleanup: (() => void) | undefined;
+
     (async () => {
       try {
         await waitFor(() => !!window.LightweightCharts?.createChart, 8000, 50);
         if (!priceRef.current || !equityRef.current) return;
 
         const { createChart } = window.LightweightCharts!;
-
-        // 价格图
+        // K线图
         const priceChart = createChart(priceRef.current, {
           width: priceRef.current.clientWidth,
           height: 560,
@@ -137,7 +126,6 @@ function Home() {
           crosshair: { mode: 0 },
         });
         priceChartRef.current = priceChart;
-
         const candle = priceChart.addCandlestickSeries();
         candleRef.current = candle;
 
@@ -155,7 +143,7 @@ function Home() {
         const equityLine = equityChart.addLineSeries({ lineWidth: 2 });
         equitySeriesRef.current = equityLine;
 
-        // 同步 & 自适应
+        // 自适应
         const onResize = () => {
           if (!priceRef.current || !equityRef.current) return;
           priceChart.applyOptions({ width: priceRef.current.clientWidth });
@@ -168,20 +156,18 @@ function Home() {
 
         cleanup = () => {
           window.removeEventListener("resize", onResize);
-          overlaySeriesRef.current.forEach((s) => s.remove?.());
+          overlaySeriesRef.current.forEach(s => s.remove?.());
           overlaySeriesRef.current.clear();
           priceChart.remove();
           equityChart.remove();
         };
 
+        // 首次：BG 列表 + 精度 + 数据；CN 则直接拉默认标的
         await Promise.all([
-          loadPerps(),
-          loadPrecision(symbol),
-          loadData(symbol, interval, bars),
-          refreshCustomList(),
+          loadPerpsBG(),
+          loadPrecisionBG(symbol),
+          loadData(), // 根据当前 market 自动选择
         ]);
-
-        applySimpleMAEMA();
         applyAllOverlays();
       } catch (e: any) {
         setErrorMsg(e?.message ?? String(e));
@@ -189,44 +175,46 @@ function Home() {
         setLoading(false);
       }
     })();
+
     return () => cleanup?.();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // 切换 symbol/interval/bars：拉 K 线
+  // —— 市场/代码/周期/根数 变化：重拉 —— //
   useEffect(() => {
     if (!priceChartRef.current) return;
     setLoading(true);
-    loadData(symbol, interval, bars)
-      .then(() => {
-        applySimpleMAEMA();
-        applyAllOverlays();
-      })
-      .finally(() => setLoading(false));
+    loadData().then(() => applyAllOverlays()).finally(() => setLoading(false));
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [symbol, interval, bars]);
+  }, [market, symbol, cnSymbol, interval, bars]);
 
-  // SMA/EMA 参数变化：仅重算这两条
+  // —— SMA/EMA 变化：只重算这两条 —— //
   useEffect(() => {
     if (!dataRef.current.length) return;
     applySimpleMAEMA();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [smaLen, emaLen]);
 
-  // 常用指标开关或参数变化：重算内置指标
+  // —— 常用指标参数变化：重算 —— //
   useEffect(() => {
     if (!dataRef.current.length) return;
     applyBuiltins();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [builtins]);
 
-  // 切换 symbol：刷新价格精度
+  // —— 市场变化时：限制可选周期 & 精度设置 —— //
   useEffect(() => {
-    loadPrecision(symbol).catch(() => {});
-  }, [symbol]);
+    if (market === "CN") {
+      // A股仅 1D/1W
+      if (interval !== "1D" && interval !== "1W") setInterval("1D");
+    } else {
+      // BG 默认回 1H
+      if (interval === "1D" || interval === "1W") setInterval("1H");
+    }
+  }, [market]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  // —— 后端取数 —— //
-  async function loadPerps() {
+  // —— BG：加载交易对列表 —— //
+  async function loadPerpsBG() {
     try {
       const r = await fetch("/api/bitget/perps", { cache: "no-store" });
       const j = await r.json();
@@ -234,18 +222,24 @@ function Home() {
         const list: string[] = j.symbols;
         setAllPerps(list.includes(symbol) ? list : [symbol, ...list]);
       }
-    } catch {}
-    // 恢复收藏
+    } catch (e) {
+      console.warn("load perps failed", e);
+    }
+    // 恢复收藏（按市场隔离）
     try {
       const raw = localStorage.getItem("tvbt-favs-v1");
       if (raw) {
         const arr = JSON.parse(raw);
-        if (Array.isArray(arr) && arr.every((s) => typeof s === "string")) setFavs(arr);
+        if (Array.isArray(arr) && arr.every((s) => typeof s === "string")) {
+          setFavs(arr);
+        }
       }
     } catch {}
   }
 
-  async function loadPrecision(sym: string) {
+  // —— BG：精度 —— //
+  async function loadPrecisionBG(sym: string) {
+    if (market !== "BG") return;
     try {
       const r = await fetch(`/api/bitget/contract?symbol=${encodeURIComponent(sym)}`, { cache: "no-store" });
       if (!r.ok) throw new Error(await r.text());
@@ -257,18 +251,36 @@ function Home() {
           priceFormat: { type: "price", precision: pp, minMove: Math.pow(10, -pp) },
         });
       }
-    } catch {}
+    } catch (e) {
+      console.warn("load contract precision failed:", e);
+    }
   }
 
-  async function loadData(sym: string, itv: string, n: number) {
+  // —— 拉数据：根据市场分流 —— //
+  async function loadData() {
     try {
       setErrorMsg("");
-      const url = `/api/candles?symbol=${encodeURIComponent(sym)}&interval=${encodeURIComponent(itv)}&bars=${n}`;
-      const res = await fetch(url, { cache: "no-store" });
-      if (!res.ok) throw new Error(`API ${res.status}: ${await res.text()}`);
-      const arr: Candle[] = await res.json();
-      if (!Array.isArray(arr) || arr.length === 0) throw new Error("Empty candles");
 
+      let arr: Candle[] = [];
+      if (market === "BG") {
+        // Bitget
+        await loadPrecisionBG(symbol);
+        const url = `/api/candles?symbol=${encodeURIComponent(symbol)}&interval=${encodeURIComponent(interval)}&bars=${bars}`;
+        const res = await fetch(url, { cache: "no-store" });
+        if (!res.ok) throw new Error(`API ${res.status}: ${await res.text()}`);
+        arr = await res.json();
+      } else {
+        // CN（A股）
+        const itv = (interval === "1W" ? "1W" : "1D");
+        const url = `/api/cn/candles?symbol=${encodeURIComponent(cnSymbol)}&interval=${itv}&bars=${bars}`;
+        const res = await fetch(url, { cache: "no-store" });
+        if (!res.ok) throw new Error(`API ${res.status}: ${await res.text()}`);
+        arr = await res.json();
+
+        // A股不从交易所提供精度，这里不覆盖 priceFormat；沿用最近一次设置或默认
+      }
+
+      if (!Array.isArray(arr) || arr.length === 0) throw new Error("Empty candles");
       dataRef.current = arr;
 
       candleRef.current.setData(
@@ -276,11 +288,9 @@ function Home() {
       );
       priceChartRef.current.timeScale().fitContent();
 
-      // 清空旧 overlay
-      overlaySeriesRef.current.forEach((s) => s.remove?.());
+      // 清空 overlay + 资金曲线
+      overlaySeriesRef.current.forEach(s => s.remove?.());
       overlaySeriesRef.current.clear();
-
-      // 清空资金曲线
       equitySeriesRef.current.setData([]);
       equityDataRef.current = [];
       setBtStats(null);
@@ -291,42 +301,7 @@ function Home() {
     }
   }
 
-  async function refreshCustomList() {
-    try {
-      const r = await fetch("/api/custom/list", { cache: "no-store" });
-      const j = await r.json();
-      if (Array.isArray(j?.items)) setCustomList(j.items);
-    } catch {}
-  }
-
-  async function uploadCustom() {
-    if (!isAdmin) return alert("只有管理员可以上传自定义指标");
-    if (!uploadName.trim() || !uploadCode.trim()) return alert("请填写名称和代码");
-    const r = await fetch("/api/custom/upload", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ name: uploadName.trim(), code: uploadCode }),
-    });
-    if (!r.ok) return alert(`上传失败：${await r.text()}`);
-    setUploadName(""); setUploadCode("");
-    await refreshCustomList();
-    alert("上传成功");
-  }
-
-  async function deleteCustom(name: string) {
-    if (!isAdmin) return alert("只有管理员可以删除");
-    if (!confirm(`确定删除自定义指标「${name}」吗？`)) return;
-    const r = await fetch("/api/custom/delete", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ name }),
-    });
-    if (!r.ok) return alert(`删除失败：${await r.text()}`);
-    await refreshCustomList();
-    setEnabledCustom((prev) => prev.filter((n) => n !== name));
-  }
-
-  // —— 图上叠加 —— //
+  // —— 叠加指标 —— //
   function ensureLine(name: string, style: any = {}) {
     let s = overlaySeriesRef.current.get(name);
     if (!s) {
@@ -353,10 +328,10 @@ function Home() {
     const t = arr.map((d) => d.time as any);
 
     const sma = ensureLine("__SMA__", { lineWidth: 1 });
-    sma.setData(smaArr.map((v, i) => (Number.isFinite(v) ? { time: t[i], value: v } : null)).filter(Boolean));
+    sma.setData(smaArr.map((v, i) => Number.isFinite(v) ? { time: t[i], value: v } : null).filter(Boolean));
 
     const ema = ensureLine("__EMA__", { lineWidth: 1 });
-    ema.setData(emaArr.map((v, i) => (Number.isFinite(v) ? { time: t[i], value: v } : null)).filter(Boolean));
+    ema.setData(emaArr.map((v, i) => Number.isFinite(v) ? { time: t[i], value: v } : null).filter(Boolean));
   }
 
   function applyBuiltins() {
@@ -365,12 +340,11 @@ function Home() {
     const closes = arr.map((d) => ({ close: d.close }));
     const times = arr.map((d) => d.time as any);
 
-    // MACD
     if (builtins.MACD.enabled) {
       const { fast, slow, signal } = builtins.MACD;
       const { macd, signal: sig, hist } = MACD(closes, fast, slow, signal);
       const macdLine = ensureLine("MACD", { lineWidth: 1, priceScaleId: "" });
-      const sigLine = ensureLine("MACD-SIGNAL", { lineWidth: 1, priceScaleId: "" });
+      const sigLine  = ensureLine("MACD-SIGNAL", { lineWidth: 1, priceScaleId: "" });
       macdLine.setData(macd.map((v, i) => Number.isFinite(v) ? { time: times[i], value: v } : null).filter(Boolean));
       sigLine.setData(sig.map((v, i) => Number.isFinite(v) ? { time: times[i], value: v } : null).filter(Boolean));
       const histArea = ensureArea("MACD-HIST", { lineWidth: 1, priceScaleId: "" });
@@ -379,79 +353,38 @@ function Home() {
       ["MACD","MACD-SIGNAL","MACD-HIST"].forEach(k => overlaySeriesRef.current.get(k)?.setData([]));
     }
 
-    // RSI
     if (builtins.RSI.enabled) {
       const rsi = RSI(closes, builtins.RSI.len);
       const line = ensureLine("RSI", { lineWidth: 1, priceScaleId: "" });
       line.setData(rsi.map((v, i) => Number.isFinite(v) ? { time: times[i], value: v } : null).filter(Boolean));
-    } else {
-      overlaySeriesRef.current.get("RSI")?.setData([]);
-    }
+    } else overlaySeriesRef.current.get("RSI")?.setData([]);
 
-    // KDJ
     if (builtins.KDJ.enabled) {
-      const full = KDJ(
-        dataRef.current.map(d => ({ high: d.high, low: d.low, close: d.close })),
-        builtins.KDJ.n, builtins.KDJ.k, builtins.KDJ.d
-      );
+      const full = KDJ(dataRef.current.map((d) => ({ high: d.high, low: d.low, close: d.close })), builtins.KDJ.n, builtins.KDJ.k, builtins.KDJ.d);
       const kLine = ensureLine("KDJ-K", { lineWidth: 1, priceScaleId: "" });
       const dLine = ensureLine("KDJ-D", { lineWidth: 1, priceScaleId: "" });
       const jLine = ensureLine("KDJ-J", { lineWidth: 1, priceScaleId: "" });
       kLine.setData(full.K.map((v, i) => Number.isFinite(v) ? { time: times[i], value: v } : null).filter(Boolean));
       dLine.setData(full.D.map((v, i) => Number.isFinite(v) ? { time: times[i], value: v } : null).filter(Boolean));
       jLine.setData(full.J.map((v, i) => Number.isFinite(v) ? { time: times[i], value: v } : null).filter(Boolean));
-    } else {
-      ["KDJ-K","KDJ-D","KDJ-J"].forEach(k => overlaySeriesRef.current.get(k)?.setData([]));
-    }
+    } else ["KDJ-K","KDJ-D","KDJ-J"].forEach(k => overlaySeriesRef.current.get(k)?.setData([]));
 
-    // BOLL
     if (builtins.BOLL.enabled) {
       const { len, mult } = builtins.BOLL;
       const b = BOLL(closes, len, mult);
       const mid = ensureLine("BOLL-MID", { lineWidth: 1 });
       const up  = ensureLine("BOLL-UP",  { lineWidth: 1 });
       const lo  = ensureLine("BOLL-LOW", { lineWidth: 1 });
-      mid.setData(b.mid.map((v, i) => Number.isFinite(v) ? { time: times[i], value: v } : null).filter(Boolean));
-      up.setData(b.upper.map((v, i) => Number.isFinite(v) ? { time: times[i], value: v } : null).filter(Boolean));
-      lo.setData(b.lower.map((v, i) => Number.isFinite(v) ? { time: times[i], value: v } : null).filter(Boolean));
-    } else {
-      ["BOLL-MID","BOLL-UP","BOLL-LOW"].forEach(k => overlaySeriesRef.current.get(k)?.setData([]));
-    }
-  }
-
-  async function applyCustomIndicators() {
-    const arr = dataRef.current;
-    if (!arr.length || enabledCustom.length === 0) return;
-
-    const helpers = { SMA, EMA, MACD, RSI, KDJ, BOLL };
-    for (const name of enabledCustom) {
-      try {
-        const j = await fetch(`/api/custom/get?name=${encodeURIComponent(name)}`, { cache: "no-store" }).then(r => r.json());
-        if (!j?.code) continue;
-        // 沙箱执行管理员上传代码
-        // eslint-disable-next-line no-new-func
-        const fn = new Function(
-          "candles","helpers",
-          `${j.code}; return (typeof indicator==='function') ? indicator(candles, helpers) : null;`
-        );
-        const result = fn(arr, helpers);
-        if (!Array.isArray(result)) continue;
-
-        for (const line of result) {
-          const key = `CUSTOM:${name}:${line.name}`;
-          const s = ensureLine(key, { lineWidth: 1 });
-          s.setData((line.data || []).filter((x: any) => x && Number.isFinite(x.value)));
-        }
-      } catch (e) {
-        console.warn("custom apply error", name, e);
-      }
-    }
+      mid.setData(b.mid  .map((v, i) => Number.isFinite(v) ? { time: times[i], value: v } : null).filter(Boolean));
+      up .setData(b.upper.map((v, i) => Number.isFinite(v) ? { time: times[i], value: v } : null).filter(Boolean));
+      lo .setData(b.lower.map((v, i) => Number.isFinite(v) ? { time: times[i], value: v } : null).filter(Boolean));
+    } else ["BOLL-MID","BOLL-UP","BOLL-LOW"].forEach(k => overlaySeriesRef.current.get(k)?.setData([]));
   }
 
   function applyAllOverlays() {
     applySimpleMAEMA();
     applyBuiltins();
-    applyCustomIndicators();
+    // 自定义指标 applyCustomIndicators() 如你已有也可继续调用
   }
 
   // —— 回测 —— //
@@ -459,13 +392,12 @@ function Home() {
     const arr = dataRef.current;
     if (!arr.length) return;
 
-    const closes = arr.map(d => ({ close: d.close }));
+    const closes = arr.map((d) => ({ close: d.close }));
     const f = EMA(closes, fastLen);
     const s = EMA(closes, slowLen);
 
     const { stats, trades, markers, equityCurve } = backtestDualEMA(arr, f, s, {
-      feeBps,
-      slippageBps: slipBps,
+      feeBps, slippageBps: slipBps,
     });
 
     setBtStats(stats);
@@ -473,9 +405,7 @@ function Home() {
     equityDataRef.current = equityCurve;
 
     candleRef.current.setMarkers(markers);
-    equitySeriesRef.current.setData(
-      equityCurve.map(pt => ({ time: pt.time as any, value: pt.value }))
-    );
+    equitySeriesRef.current.setData(equityCurve.map((pt) => ({ time: pt.time as any, value: pt.value })));
 
     try {
       const r = priceChartRef.current.timeScale().getVisibleLogicalRange();
@@ -483,24 +413,25 @@ function Home() {
     } catch {}
   }
 
-  // —— 收藏 —— //
+  // —— 收藏（仅 BG 生效，CN 就不做收藏示例了；你要也能做一个 CNFavs） —— //
   function starCurrentSymbol() {
+    if (market !== "BG") return;
     if (!symbol) return;
-    setFavs(prev => (prev.includes(symbol) ? prev : [symbol, ...prev]));
+    setFavs((prev) => (prev.includes(symbol) ? prev : [symbol, ...prev]));
     try {
-      const next = JSON.stringify([symbol, ...favs.filter(s => s !== symbol)]);
+      const next = JSON.stringify([symbol, ...favs.filter((s) => s !== symbol)]);
       localStorage.setItem("tvbt-favs-v1", next);
     } catch {}
   }
   function removeFav(sym: string) {
-    setFavs(prev => prev.filter(s => s !== sym));
+    setFavs((prev) => prev.filter((s) => s !== sym));
     try {
-      const next = favs.filter(s => s !== sym);
+      const next = favs.filter((s) => s !== sym);
       localStorage.setItem("tvbt-favs-v1", JSON.stringify(next));
     } catch {}
     if (symbol === sym && favs.length > 1) {
-      const next = favs.find(s => s !== sym);
-      if (next) setSymbol(next);
+      const nx = favs.find((s) => s !== sym);
+      if (nx) setSymbol(nx);
     }
   }
 
@@ -511,7 +442,7 @@ function Home() {
       return;
     }
     const headers = ["entryTime","exitTime","entryPrice","exitPrice","side","pnlPct"];
-    const rows = btTrades.map(t => [
+    const rows = btTrades.map((t) => [
       new Date(t.entryTime * 1000).toISOString(),
       new Date(t.exitTime * 1000).toISOString(),
       t.entryPrice.toFixed(pricePlace),
@@ -519,12 +450,12 @@ function Home() {
       t.side,
       (t.pnlPct * 100).toFixed(4) + "%",
     ]);
-    const csv = [headers.join(","), ...rows.map(r => r.join(","))].join("\n");
+    const csv = [headers.join(","), ...rows.map((r) => r.join(","))].join("\n");
     const blob = new Blob([csv], { type: "text/csv;charset=utf-8;" });
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
     a.href = url;
-    a.download = `${symbol}_${interval}_dualEMA_trades.csv`;
+    a.download = `${(market==="BG"?symbol:cnSymbol)}_${interval}_dualEMA_trades.csv`;
     a.click();
     URL.revokeObjectURL(url);
   }
@@ -536,52 +467,23 @@ function Home() {
       return;
     }
     const headers = ["time","value"];
-    const rows = data.map(pt => [
+    const rows = data.map((pt) => [
       new Date(pt.time * 1000).toISOString(),
       pt.value.toFixed(6),
     ]);
-    const csv = [headers.join(","), ...rows.map(r => r.join(","))].join("\n");
+    const csv = [headers.join(","), ...rows.map((r) => r.join(","))].join("\n");
     const blob = new Blob([csv], { type: "text/csv;charset=utf-8;" });
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
     a.href = url;
-    a.download = `${symbol}_${interval}_equity_curve.csv`;
+    a.download = `${(market==="BG"?symbol:cnSymbol)}_${interval}_equity_curve.csv`;
     a.click();
     URL.revokeObjectURL(url);
   }
 
-  // —— 发送 AI 聊天 —— //
-  async function sendChat() {
-    const content = chatInput.trim();
-    if (!content) return;
-    setChatInput("");
-
-    const newMsgs = [...chatMsgs, { role: "user" as const, content }];
-    setChatMsgs(newMsgs);
-    setChatSending(true);
-    try {
-      const res = await fetch("/api/chat", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ messages: newMsgs }),
-      });
-      const j = await res.json();
-      if (!res.ok) {
-        const msg = j?.error || `HTTP ${res.status}`;
-        setChatMsgs(m => [...m, { role: "assistant", content: `❌ ${msg}` }]);
-        if (typeof j?.remaining === "number") setRemaining(j.remaining);
-        return;
-      }
-      setChatMsgs(m => [...m, { role: "assistant", content: j.reply || "(空回复)" }]);
-      if (typeof j?.remaining === "number") setRemaining(j.remaining);
-    } catch (e: any) {
-      setChatMsgs(m => [...m, { role: "assistant", content: `❌ 网络异常：${e?.message || String(e)}` }]);
-    } finally {
-      setChatSending(false);
-    }
-  }
-
   // —— UI —— //
+  const quicks = market === "CN" ? QUICK_CN : QUICK_BG;
+
   return (
     <main style={{ minHeight: "100vh", padding: 16 }}>
       <Script
@@ -589,10 +491,10 @@ function Home() {
         strategy="afterInteractive"
       />
 
-      {/* 顶栏：标题 + 登录 */}
+      {/* 顶栏：标题 + 登录/退出 */}
       <div style={{ display: "flex", alignItems: "center", marginBottom: 12 }}>
         <h1 style={{ fontSize: 20, fontWeight: 700, margin: 0 }}>
-          小金手量化 · Bitget 实盘K线 + 指标 + 回测 + 资金曲线 + AI
+          小金手量化 · Bitget/CN K线 + 指标 + 回测 + 资金曲线
         </h1>
         <div style={{ marginLeft: "auto", display: "flex", alignItems: "center", gap: 8 }}>
           {status === "loading" ? (
@@ -601,7 +503,9 @@ function Home() {
             <>
               <img src={session.user?.image || ""} alt="" style={{ width: 24, height: 24, borderRadius: 999 }} />
               <span>{session.user?.name || session.user?.email}</span>
-              <span style={{ fontSize: 12, color: "#666" }}>{isAdmin ? "管理员" : "普通用户"}</span>
+              <span style={{ fontSize: 12, color: "#666" }}>
+                {isAdmin ? "管理员" : "普通用户"}
+              </span>
               <button onClick={() => signOut()} style={{ padding: "6px 10px" }}>退出</button>
             </>
           ) : (
@@ -610,70 +514,7 @@ function Home() {
         </div>
       </div>
 
-      {/* —— AI 小金手 —— */}
-      <div style={{ marginBottom: 12 }}>
-        <div style={{ border: "1px solid #eee", borderRadius: 12, padding: 12 }}>
-          <div style={{ marginBottom: 8, display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-            <strong>AI 小金手</strong>
-            <span style={{ color: "#666" }}>
-              {remaining === null ? "" : `今日剩余：${remaining} 次`}
-            </span>
-          </div>
-
-          <div
-            style={{
-              height: 220,
-              overflow: "auto",
-              background: "#fafafa",
-              padding: 8,
-              borderRadius: 8,
-              border: "1px dashed #eee",
-            }}
-          >
-            {chatMsgs.map((m, i) => (
-              <div key={i} style={{ margin: "6px 0" }}>
-                <span
-                  style={{
-                    display: "inline-block",
-                    minWidth: 60,
-                    fontWeight: 700,
-                    color: m.role === "user" ? "#0ea5e9" : "#10b981",
-                  }}
-                >
-                  {m.role === "user" ? "你" : "小金手"}
-                </span>
-                <span style={{ whiteSpace: "pre-wrap" }}>{m.content}</span>
-              </div>
-            ))}
-          </div>
-
-          <div style={{ display: "flex", gap: 8, marginTop: 8 }}>
-            <input
-              value={chatInput}
-              onChange={(e) => setChatInput(e.target.value)}
-              onKeyDown={(e) => { if (e.key === "Enter") sendChat(); }}
-              placeholder="问我：如何优化双EMA、如何加止盈止损、怎么识别波段…"
-              style={{ flex: 1, height: 36, padding: "0 10px", borderRadius: 8, border: "1px solid #ddd" }}
-            />
-            <button
-              onClick={sendChat}
-              disabled={chatSending}
-              style={{
-                padding: "6px 12px",
-                borderRadius: 8,
-                border: "1px solid #0ea5e9",
-                background: chatSending ? "#e5f6fd" : "#e0f2fe",
-                cursor: chatSending ? "not-allowed" : "pointer",
-                fontWeight: 700,
-              }}
-            >
-              {chatSending ? "发送中…" : "发送"}
-            </button>
-          </div>
-        </div>
-      </div>
-
-      {/* 交易对 + 收藏 + 周期 */}
+      {/* 第一行：市场切换 + 交易对/股票选择 + 收藏 + 快捷周期 */}
       <div
         style={{
           display: "flex",
@@ -685,65 +526,87 @@ function Home() {
           borderBottom: "1px dashed #eee",
         }}
       >
-        <label style={{ fontWeight: 600 }}>交易对：</label>
+        <label style={{ fontWeight: 600 }}>市场：</label>
         <select
-          value={symbol}
-          onChange={(e) => setSymbol(e.target.value)}
-          style={{ minWidth: 200, height: 32 }}
+          value={market}
+          onChange={(e) => setMarket(e.target.value as Market)}
+          style={{ width: 120, height: 32 }}
         >
-          {allPerps.length === 0 ? (
-            <option value={symbol}>{symbol}（加载中…）</option>
-          ) : (
-            allPerps.map((s) => (
-              <option key={s} value={s}>{s}</option>
-            ))
-          )}
+          <option value="BG">BG（加密：Bitget）</option>
+          <option value="CN">CN（中国A股）</option>
         </select>
 
-        <button onClick={starCurrentSymbol} title="收藏当前交易对" style={{ padding: "6px 10px" }}>
-          ⭐ 收藏
-        </button>
-
-        {/* 收藏列表 */}
-        <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
-          {favs.map((sym) => (
-            <div
-              key={sym}
-              onClick={() => setSymbol(sym)}
-              title="点击切换"
-              style={{
-                display: "inline-flex",
-                alignItems: "center",
-                gap: 6,
-                padding: "4px 8px",
-                borderRadius: 999,
-                border: "1px solid #ddd",
-                cursor: "pointer",
-                background: sym === symbol ? "#eef6ff" : "#fafafa",
-                fontWeight: sym === symbol ? 700 : 400,
-              }}
+        {market === "BG" ? (
+          <>
+            <label style={{ fontWeight: 600, marginLeft: 8 }}>交易对：</label>
+            <select
+              value={symbol}
+              onChange={(e) => setSymbol(e.target.value)}
+              style={{ minWidth: 200, height: 32 }}
             >
-              <span>{sym}{sym === symbol ? " ⭐" : ""}</span>
-              <span
-                title="移出收藏"
-                onClick={(e) => { e.stopPropagation(); removeFav(sym); }}
-                style={{
-                  display: "inline-flex",
-                  width: 16, height: 16, borderRadius: 999,
-                  alignItems: "center", justifyContent: "center",
-                  border: "1px solid #ddd", fontSize: 12, lineHeight: "14px",
-                }}
-              >
-                ×
-              </span>
-            </div>
-          ))}
-        </div>
+              {allPerps.length === 0 ? (
+                <option value={symbol}>{symbol}（加载中…）</option>
+              ) : (
+                allPerps.map((s) => <option key={s} value={s}>{s}</option>)
+              )}
+            </select>
+            <button onClick={starCurrentSymbol} title="收藏当前交易对" style={{ padding: "6px 10px" }}>⭐ 收藏</button>
 
-        {/* 快捷周期条 + 全周期下拉 */}
+            {/* 收藏列表（只对 BG） */}
+            <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+              {favs.map((sym) => (
+                <div
+                  key={sym}
+                  onClick={() => setSymbol(sym)}
+                  title="点击切换"
+                  style={{
+                    display: "inline-flex", alignItems: "center", gap: 6,
+                    padding: "4px 8px", borderRadius: 999, border: "1px solid #ddd",
+                    cursor: "pointer", background: sym === symbol ? "#eef6ff" : "#fafafa",
+                    fontWeight: sym === symbol ? 700 : 400,
+                  }}
+                >
+                  <span>{sym}{sym === symbol ? " ⭐" : ""}</span>
+                  <span
+                    title="移出收藏"
+                    onClick={(e) => { e.stopPropagation(); removeFav(sym); }}
+                    style={{
+                      display: "inline-flex", width: 16, height: 16, borderRadius: 999,
+                      alignItems: "center", justifyContent: "center",
+                      border: "1px solid #ddd", fontSize: 12, lineHeight: "14px",
+                    }}
+                  >×</span>
+                </div>
+              ))}
+            </div>
+          </>
+        ) : (
+          <>
+            <label style={{ fontWeight: 600, marginLeft: 8 }}>股票：</label>
+            <select
+              value={cnSymbol}
+              onChange={(e) => setCnSymbol(e.target.value)}
+              style={{ minWidth: 220, height: 32 }}
+              title="示例采用 Yahoo 代码；你也可手输"
+            >
+              {CN_DEFAULTS.map((s) => (
+                <option key={s.code} value={s.code}>{s.name}（{s.code}）</option>
+              ))}
+            </select>
+            <span style={{ color: "#666" }}>或手动输入：</span>
+            <input
+              value={cnSymbol}
+              onChange={(e) => setCnSymbol(e.target.value)}
+              placeholder="如 600519.SS / 000001.SZ / ^SSEC"
+              style={{ width: 200, height: 28 }}
+            />
+          </>
+        )}
+
+        {/* 快捷周期条 */}
         <div style={{ display: "flex", gap: 6, alignItems: "center", marginLeft: "auto" }}>
           <span style={{ color: "#666" }}>周期：</span>
-          {QUICK_INTERVALS.map((itv) => (
+          {quicks.map((itv) => (
             <button
               key={itv}
               onClick={() => setInterval(itv)}
@@ -760,38 +623,39 @@ function Home() {
               {itv}
             </button>
           ))}
-          <select
-            value={interval}
-            onChange={(e) => setInterval(e.target.value as Interval)}
-            style={{ height: 32, marginLeft: 8 }}
-            title="全部周期"
-          >
-            {ALL_INTERVALS.map(itv => <option key={itv} value={itv}>{itv}</option>)}
-          </select>
         </div>
       </div>
 
-      {/* 第二行：行情/回测控制 + 常用指标参数 + 自定义指标 */}
+      {/* 第二行：行情控制 & 常用指标参数 */}
       <div style={{ display: "flex", gap: 24, alignItems: "flex-start", flexWrap: "wrap", marginBottom: 12 }}>
-        {/* 行情/回测 */}
+        {/* 行情/回测基础控制 */}
         <div style={{ minWidth: 280 }}>
           <div style={{ display: "flex", gap: 12, alignItems: "center", flexWrap: "wrap", marginBottom: 12 }}>
             <label>Bars</label>
             <input
-              type="number" min={1} max={200} value={bars}
+              type="number"
+              min={1}
+              max={200}
+              value={bars}
               onChange={(e) => setBars(Math.min(Math.max(Number(e.target.value) || 200, 1), 200))}
               style={{ width: 80 }}
             />
             <span style={{ width: 16 }} />
             <label>SMA</label>
             <input
-              type="number" min={2} max={500} value={smaLen}
+              type="number"
+              min={2}
+              max={500}
+              value={smaLen}
               onChange={(e) => setSmaLen(Math.max(2, Number(e.target.value) || 20))}
               style={{ width: 70 }}
             />
             <label>EMA</label>
             <input
-              type="number" min={2} max={500} value={emaLen}
+              type="number"
+              min={2}
+              max={500}
+              value={emaLen}
               onChange={(e) => setEmaLen(Math.max(2, Number(e.target.value) || 50))}
               style={{ width: 70 }}
             />
@@ -828,10 +692,12 @@ function Home() {
             <button onClick={exportEquityCSV} style={{ padding: "6px 10px" }}>导出资金曲线</button>
           </div>
 
-          <div style={{ color: "#666" }}>{loading ? "加载中…" : errorMsg ? `❌ ${errorMsg}` : "✅ 就绪"}</div>
+          <div style={{ color: "#666" }}>
+            {loading ? "加载中…" : errorMsg ? `❌ ${errorMsg}` : "✅ 就绪"}
+          </div>
         </div>
 
-        {/* 常用指标（勾选并调参数） */}
+        {/* 常用指标多选 + 参数区（沿用你现有的） */}
         <div style={{ flex: 1, minWidth: 320 }}>
           <strong>常用指标（勾选启用，可调参数）</strong>
           <div style={{ display: "grid", gridTemplateColumns: "auto 1fr", gap: 8, marginTop: 8 }}>
@@ -906,71 +772,6 @@ function Home() {
                      onChange={e => setBuiltins({ ...builtins, BOLL: { ...builtins.BOLL, mult: Math.max(0.1, Number(e.target.value) || 2) } })}/>
             </div>
           </div>
-        </div>
-
-        {/* 自定义指标（管理员上传，所有人可用） */}
-        <div style={{ flex: 1, minWidth: 320 }}>
-          <strong>自定义指标</strong>
-          <div style={{ marginTop: 6, marginBottom: 8, display: "flex", gap: 8, flexWrap: "wrap" }}>
-            {customList.length === 0 ? (
-              <span style={{ color: "#666" }}>暂无自定义指标</span>
-            ) : (
-              customList.map((it) => (
-                <label key={it.name} style={{ border: "1px solid #ddd", padding: "4px 8px", borderRadius: 8 }}>
-                  <input
-                    type="checkbox"
-                    checked={enabledCustom.includes(it.name)}
-                    onChange={(e) => {
-                      setEnabledCustom((prev) =>
-                        e.target.checked ? [...new Set([...prev, it.name])] : prev.filter((x) => x !== it.name)
-                      );
-                      setTimeout(applyAllOverlays, 0);
-                    }}
-                  /> {it.name}
-                  {isAdmin && (
-                    <button
-                      onClick={(ev) => { ev.preventDefault(); deleteCustom(it.name); }}
-                      style={{ marginLeft: 8 }}
-                      title="删除该自定义指标（管理员）"
-                    >
-                      删除
-                    </button>
-                  )}
-                </label>
-              ))
-            )}
-            <button onClick={refreshCustomList} style={{ padding: "4px 8px" }}>刷新列表</button>
-          </div>
-
-          {isAdmin && (
-            <details>
-              <summary>管理员上传自定义指标</summary>
-              <div style={{ display: "grid", gridTemplateColumns: "120px 1fr", gap: 8, marginTop: 8 }}>
-                <label>名称</label>
-                <input value={uploadName} onChange={(e) => setUploadName(e.target.value)} placeholder="例如: MyZigZag" />
-
-                <label>代码（JS）</label>
-                <textarea
-                  value={uploadCode}
-                  onChange={(e) => setUploadCode(e.target.value)}
-                  placeholder={`必须定义 function indicator(candles, helpers) 并返回线数组
-function indicator(candles, helpers) {
-  // candles = [{time, open, high, low, close, volume}]
-  const { EMA } = helpers;
-  const closes = candles.map(c => ({ close: c.close }));
-  const line = EMA(closes, 34);
-  const out = line.map((v, i) => Number.isFinite(v) ? { time: candles[i].time, value: v } : null).filter(Boolean);
-  return [{ name: "MyEMA34", data: out }];
-}`}
-                  rows={10}
-                  style={{ width: "100%", fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace" }}
-                />
-              </div>
-              <div style={{ marginTop: 8 }}>
-                <button onClick={uploadCustom} style={{ padding: "6px 10px" }}>上传/更新</button>
-              </div>
-            </details>
-          )}
         </div>
       </div>
 

@@ -1,145 +1,110 @@
-import { NextResponse } from "next/server";
-import { z } from "zod";
+// src/app/api/candles/route.ts
+import { NextRequest, NextResponse } from "next/server";
 
-export const runtime = "edge";
-export const dynamic = "force-dynamic";
+/**
+ * Bitget USDT 永续的最新K线（不传 start/end，只用 limit 拿最近 N 根，避免 40017）
+ * Query:
+ *   symbol=BTCUSDT
+ *   interval=1m|3m|5m|15m|30m|1H|4H|6H|12H|1D|3D|1W|1M
+ *   bars=1..200
+ *   productType=UMCBL（默认）
+ */
 
-const querySchema = z.object({
-  symbol: z.string().min(1),
-  interval: z.string().min(1),
-  bars: z.coerce.number().min(1).max(200),
-});
+type Candle = {
+  time: number;  // 秒级时间戳
+  open: number;
+  high: number;
+  low: number;
+  close: number;
+  volume?: number;
+};
 
-// 粒度映射：Bitget 常见粒度
-const VALID = new Set([
-  "1m","3m","5m","15m","30m",
-  "1H","4H","6H","12H",
-  "1D","3D","1W","1M"
-]);
+const intervalToGranularity: Record<string, number> = {
+  "1m": 60,
+  "3m": 180,
+  "5m": 300,
+  "15m": 900,
+  "30m": 1800,
+  "1H": 3600,
+  "4H": 14400,
+  "6H": 21600,
+  "12H": 43200,
+  "1D": 86400,
+  "3D": 86400 * 3,
+  "1W": 604800,
+  "1M": 2592000,
+};
 
-function normalizeGranularity(interval: string): string {
-  const s = interval.trim();
-  const lower = s.toLowerCase();
-  if (["1m","3m","5m","15m","30m"].includes(lower)) return lower; // 分钟小写
-  const upper = s.toUpperCase();
-  if (VALID.has(upper)) return upper; // H/D/W/M 大写
-  return "1H";
+function toStr(v: any, d = "") { return typeof v === "string" && v ? v : d; }
+function toInt(v: any, d: number) {
+  const n = Number(v);
+  return Number.isFinite(n) ? n : d;
 }
 
-// 每根K线毫秒数（估算月=30天、周=7天、3D=3天）
-function msPerCandle(gran: string): number {
-  switch (gran) {
-    case "1m": return 60_000;
-    case "3m": return 3 * 60_000;
-    case "5m": return 5 * 60_000;
-    case "15m": return 15 * 60_000;
-    case "30m": return 30 * 60_000;
-    case "1H": return 60 * 60_000;
-    case "4H": return 4 * 60 * 60_000;
-    case "6H": return 6 * 60 * 60_000;
-    case "12H": return 12 * 60 * 60_000;
-    case "1D": return 24 * 60 * 60_000;
-    case "3D": return 3 * 24 * 60 * 60_000;
-    case "1W": return 7 * 24 * 60 * 60_000;
-    case "1M": return 30 * 24 * 60 * 60_000;
-    default:   return 60 * 60_000; // 兜底1H
-  }
-}
-
-// --- v2 优先：history-candles（正确：productType 用 USDT-FUTURES） ---
-function buildV2Url(symbol: string, granularity: string, startMs: number, endMs: number) {
-  const params = new URLSearchParams({
-    symbol,
-    productType: "USDT-FUTURES",   // ← 这里改成 USDT-FUTURES
-    granularity,
-    startTime: String(startMs),
-    endTime: String(endMs),
-  });
-  return `https://api.bitget.com/api/v2/mix/market/history-candles?${params.toString()}`;
-}
-// --- v1 回退：candles（支持 limit），symbol 需 _UMCBL ---
-function buildV1Url(symbol: string, granularity: string, limit: number) {
-  const params = new URLSearchParams({
-    symbol: `${symbol}_UMCBL`,
-    granularity,
-    limit: String(limit),
-  });
-  return `https://api.bitget.com/api/mix/v1/market/candles?${params.toString()}`;
-}
-
-// 统一解析 Bitget K线 -> { time,open,high,low,close,volume }
-function parseCandles(j: any) {
-  const rows = j?.data;
-  if (!Array.isArray(rows)) return [];
-  return rows.map((r: any[]) => ({
-    time: Math.floor(Number(r[0]) / 1000), // ts ms -> s
-    open: Number(r[1]),
-    high: Number(r[2]),
-    low: Number(r[3]),
-    close: Number(r[4]),
-    volume: Number(r[5]),
-  })).filter(c =>
-    Number.isFinite(c.time) && Number.isFinite(c.open) &&
-    Number.isFinite(c.high) && Number.isFinite(c.low) && Number.isFinite(c.close)
-  );
-}
-
-export async function GET(req: Request) {
-  const { searchParams } = new URL(req.url);
-  const parsed = querySchema.safeParse({
-    symbol: searchParams.get("symbol") ?? undefined,
-    interval: searchParams.get("interval") ?? undefined,
-    bars: searchParams.get("bars") ?? undefined,
-  });
-  if (!parsed.success) {
-    return NextResponse.json({ error: parsed.error.flatten() }, { status: 400 });
-  }
-
-  const { symbol, interval, bars } = parsed.data;
-  const granularity = normalizeGranularity(interval);
-
-  // 计算 v2 所需时间窗
-  const now = Date.now();
-  const span = msPerCandle(granularity) * bars;
-  const startMs = now - span;
-  const endMs = now;
-
-  // --- 尝试 v2（带 start/end） ---
+export async function GET(req: NextRequest) {
   try {
-    const urlV2 = buildV2Url(symbol, granularity, startMs, endMs);
-    const r = await fetch(urlV2, { headers: { accept: "application/json" }, next: { revalidate: 0 } });
-    const j = await r.json();
+    const { searchParams } = new URL(req.url);
+    const rawSymbol = toStr(searchParams.get("symbol"), "BTCUSDT").toUpperCase();
+    const interval = toStr(searchParams.get("interval"), "1H");
+    const bars = Math.max(1, Math.min(toInt(searchParams.get("bars"), 200), 200));
+    const productType = (toStr(searchParams.get("productType"), "UMCBL") || "UMCBL").toUpperCase();
 
-    if (r.ok && j?.code === "00000") {
-      const candles = parseCandles(j);
-      if (candles.length) return NextResponse.json(candles);
-      // 没数据则回退 v1
-    } else {
-      // 如果是参数验证失败/不存在，回退 v1；其它错误直接透传
-      const code = j?.code;
-      if (code && code !== "40034" && code !== "400172" && code !== "00172") {
-        return NextResponse.json({ error: `Bitget ${r.status}: ${JSON.stringify(j)}` }, { status: 400 });
-      }
-      // 继续回退 v1
+    if (!intervalToGranularity[interval]) {
+      return NextResponse.json({ error: `Unsupported interval: ${interval}` }, { status: 400 });
     }
-  } catch {
-    // 网络错误，回退 v1
-  }
 
-  // --- 回退 v1（limit） ---
-  try {
-    const urlV1 = buildV1Url(symbol, granularity, bars);
-    const r = await fetch(urlV1, { headers: { accept: "application/json" }, next: { revalidate: 0 } });
-    const j = await r.json();
+    // Bitget 需要带后缀
+    const symbol = rawSymbol.includes("_")
+      ? rawSymbol
+      : `${rawSymbol}_${productType}`;
 
-    if (r.ok && j?.code === "00000") {
-      const candles = parseCandles(j);
-      if (candles.length) return NextResponse.json(candles);
-      return NextResponse.json({ error: "No candles returned from Bitget v1." }, { status: 502 });
-    } else {
-      return NextResponse.json({ error: `Bitget ${r.status}: ${JSON.stringify(j)}` }, { status: 400 });
+    // 直接用 limit 取最近 N 根，避免 start/end 校验问题
+    const gran = intervalToGranularity[interval];
+    const url = `https://api.bitget.com/api/mix/v1/market/candles?symbol=${encodeURIComponent(symbol)}&granularity=${gran}&limit=${bars}`;
+
+    const r = await fetch(url, { cache: "no-store" });
+    const text = await r.text();
+    if (!r.ok) {
+      return NextResponse.json({ error: `Bitget ${r.status}: ${text}` }, { status: 400 });
     }
+
+    // Bitget 返回格式示例（字符串数组，时间戳毫秒，倒序or正序取决于接口）
+    // [
+    //   ["1700000000000","open","high","low","close","volume","turnover"],
+    //   ...
+    // ]
+    let raw: any;
+    try { raw = JSON.parse(text); } catch { raw = null; }
+
+    if (!Array.isArray(raw)) {
+      return NextResponse.json({ error: `Unexpected response: ${text.slice(0, 200)}` }, { status: 502 });
+    }
+
+    // 正常按时间升序输出
+    const rows = raw
+      .map((it: any) => {
+        const ts = Number(it?.[0]);
+        const o = Number(it?.[1]);
+        const h = Number(it?.[2]);
+        const l = Number(it?.[3]);
+        const c = Number(it?.[4]);
+        const v = Number(it?.[5]);
+        if (![ts, o, h, l, c].every(Number.isFinite)) return null;
+        return {
+          time: Math.floor(ts / 1000),
+          open: o, high: h, low: l, close: c,
+          volume: Number.isFinite(v) ? v : undefined,
+        } as Candle;
+      })
+      .filter(Boolean) as Candle[];
+
+    // 有些接口是倒序，按 time 排一下
+    rows.sort((a, b) => a.time - b.time);
+
+    return NextResponse.json(rows.slice(-bars));
   } catch (e: any) {
-    return NextResponse.json({ error: String(e) }, { status: 502 });
+    return NextResponse.json({ error: e?.message || String(e) }, { status: 500 });
   }
 }
+
+export const runtime = "nodejs";

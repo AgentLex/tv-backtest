@@ -22,10 +22,11 @@ type Market = "BG" | "CN"; // BG=Bitget加密; CN=A股
 type Interval =
   | "1m" | "3m" | "5m" | "15m" | "30m"
   | "1H" | "4H" | "6H" | "12H"
-  | "1D" | "3D" | "1W" | "1M";
+  | "1D" | "3D" | "1W" | "1M"
+  | "60m"; // 额外：给CN分钟线用
 
 const QUICK_BG: Interval[] = ["1m", "15m", "1H", "4H", "1D"];
-const QUICK_CN: Interval[] = ["1D", "1W"]; // A股仅开放日/周
+const QUICK_CN: Interval[] = ["1m", "5m", "15m", "30m", "60m", "1D", "1W"]; // CN 支持分钟+日周
 
 // —— 常用指标 —— //
 type BuiltinKey = "MACD" | "RSI" | "KDJ" | "BOLL";
@@ -36,8 +37,7 @@ type BuiltinConfig = {
   BOLL: { len: number; mult: number; enabled: boolean };
 };
 
-// —— A股示例列表（你可自由增删）—— //
-// 注意：这里是 Yahoo 的代码格式
+// —— A股示例列表 —— //
 const CN_DEFAULTS = [
   { code: "600519.SS", name: "贵州茅台" },
   { code: "601318.SS", name: "中国平安" },
@@ -103,7 +103,7 @@ export default function Home() {
   const [allPerps, setAllPerps] = useState<string[]>([]);
   const [favs, setFavs] = useState<string[]>([]);
 
-  // 价格小数位（BG 从 Bitget 拿；CN 由数据本身决定，保留原逻辑）
+  // 价格小数位（BG 从 Bitget 拿；CN 维持当前）
   const [pricePlace, setPricePlace] = useState<number>(2);
 
   // —— 初始化：搭图 & 首次加载 —— //
@@ -162,7 +162,7 @@ export default function Home() {
           equityChart.remove();
         };
 
-        // 首次：BG 列表 + 精度 + 数据；CN 则直接拉默认标的
+        // 首次：BG 列表 + 精度 + 数据
         await Promise.all([
           loadPerpsBG(),
           loadPrecisionBG(symbol),
@@ -202,16 +202,15 @@ export default function Home() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [builtins]);
 
-  // —— 市场变化时：限制可选周期 & 精度设置 —— //
+  // —— 市场变化：调整默认周期 —— //
   useEffect(() => {
     if (market === "CN") {
-      // A股仅 1D/1W
-      if (interval !== "1D" && interval !== "1W") setInterval("1D");
+      if (!QUICK_CN.includes(interval)) setInterval("1D");
     } else {
-      // BG 默认回 1H
-      if (interval === "1D" || interval === "1W") setInterval("1H");
+      if (!QUICK_BG.includes(interval)) setInterval("1H");
     }
-  }, [market]); // eslint-disable-line react-hooks/exhaustive-deps
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [market]);
 
   // —— BG：加载交易对列表 —— //
   async function loadPerpsBG() {
@@ -225,12 +224,12 @@ export default function Home() {
     } catch (e) {
       console.warn("load perps failed", e);
     }
-    // 恢复收藏（按市场隔离）
+    // 恢复收藏（按市场隔离也可以，但现在共用）
     try {
       const raw = localStorage.getItem("tvbt-favs-v1");
       if (raw) {
         const arr = JSON.parse(raw);
-        if (Array.isArray(arr) && arr.every((s) => typeof s === "string")) {
+        if (Array.isArray(arr) && arr.every((s: any) => typeof s === "string")) {
           setFavs(arr);
         }
       }
@@ -263,21 +262,25 @@ export default function Home() {
 
       let arr: Candle[] = [];
       if (market === "BG") {
-        // Bitget
         await loadPrecisionBG(symbol);
         const url = `/api/candles?symbol=${encodeURIComponent(symbol)}&interval=${encodeURIComponent(interval)}&bars=${bars}`;
         const res = await fetch(url, { cache: "no-store" });
         if (!res.ok) throw new Error(`API ${res.status}: ${await res.text()}`);
         arr = await res.json();
       } else {
-        // CN（A股）
-        const itv = (interval === "1W" ? "1W" : "1D");
-        const url = `/api/cn/candles?symbol=${encodeURIComponent(cnSymbol)}&interval=${itv}&bars=${bars}`;
-        const res = await fetch(url, { cache: "no-store" });
-        if (!res.ok) throw new Error(`API ${res.status}: ${await res.text()}`);
-        arr = await res.json();
-
-        // A股不从交易所提供精度，这里不覆盖 priceFormat；沿用最近一次设置或默认
+        // CN：分钟走 intraday，日/周走 candles
+        if (["1m","5m","15m","30m","60m"].includes(interval)) {
+          const url = `/api/cn/intraday?symbol=${encodeURIComponent(cnSymbol)}&interval=${interval}&bars=${bars}`;
+          const res = await fetch(url, { cache: "no-store" });
+          if (!res.ok) throw new Error(`API ${res.status}: ${await res.text()}`);
+          arr = await res.json();
+        } else {
+          const itv = (interval === "1W" ? "1W" : "1D");
+          const url = `/api/cn/candles?symbol=${encodeURIComponent(cnSymbol)}&interval=${itv}&bars=${bars}`;
+          const res = await fetch(url, { cache: "no-store" });
+          if (!res.ok) throw new Error(`API ${res.status}: ${await res.text()}`);
+          arr = await res.json();
+        }
       }
 
       if (!Array.isArray(arr) || arr.length === 0) throw new Error("Empty candles");
@@ -384,7 +387,6 @@ export default function Home() {
   function applyAllOverlays() {
     applySimpleMAEMA();
     applyBuiltins();
-    // 自定义指标 applyCustomIndicators() 如你已有也可继续调用
   }
 
   // —— 回测 —— //
@@ -413,7 +415,7 @@ export default function Home() {
     } catch {}
   }
 
-  // —— 收藏（仅 BG 生效，CN 就不做收藏示例了；你要也能做一个 CNFavs） —— //
+  // —— 收藏（BG） —— //
   function starCurrentSymbol() {
     if (market !== "BG") return;
     if (!symbol) return;
@@ -494,7 +496,7 @@ export default function Home() {
       {/* 顶栏：标题 + 登录/退出 */}
       <div style={{ display: "flex", alignItems: "center", marginBottom: 12 }}>
         <h1 style={{ fontSize: 20, fontWeight: 700, margin: 0 }}>
-          小金手量化 · Bitget/CN K线 + 指标 + 回测 + 资金曲线
+          小金手量化 · BG/CN K线 + 指标 + 回测 + 资金曲线
         </h1>
         <div style={{ marginLeft: "auto", display: "flex", alignItems: "center", gap: 8 }}>
           {status === "loading" ? (
@@ -606,7 +608,7 @@ export default function Home() {
         {/* 快捷周期条 */}
         <div style={{ display: "flex", gap: 6, alignItems: "center", marginLeft: "auto" }}>
           <span style={{ color: "#666" }}>周期：</span>
-          {quicks.map((itv) => (
+          {(market === "CN" ? QUICK_CN : QUICK_BG).map((itv) => (
             <button
               key={itv}
               onClick={() => setInterval(itv)}
@@ -626,7 +628,7 @@ export default function Home() {
         </div>
       </div>
 
-      {/* 第二行：行情控制 & 常用指标参数 */}
+      {/* 第二行：行情控制 & 常用指标参数（与之前一致） */}
       <div style={{ display: "flex", gap: 24, alignItems: "flex-start", flexWrap: "wrap", marginBottom: 12 }}>
         {/* 行情/回测基础控制 */}
         <div style={{ minWidth: 280 }}>
@@ -697,7 +699,7 @@ export default function Home() {
           </div>
         </div>
 
-        {/* 常用指标多选 + 参数区（沿用你现有的） */}
+        {/* 常用指标多选 + 参数区（与之前一致） */}
         <div style={{ flex: 1, minWidth: 320 }}>
           <strong>常用指标（勾选启用，可调参数）</strong>
           <div style={{ display: "grid", gridTemplateColumns: "auto 1fr", gap: 8, marginTop: 8 }}>

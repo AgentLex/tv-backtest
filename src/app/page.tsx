@@ -610,11 +610,11 @@ function Home() {
         </div>
       </div>
 
-      {/* —— AI 小傻瓜 —— */}
+      {/* —— AI 小金手 —— */}
       <div style={{ marginBottom: 12 }}>
         <div style={{ border: "1px solid #eee", borderRadius: 12, padding: 12 }}>
           <div style={{ marginBottom: 8, display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-            <strong>AI 小傻瓜 · 每 IP 每天限额</strong>
+            <strong>AI 小金手</strong>
             <span style={{ color: "#666" }}>
               {remaining === null ? "" : `今日剩余：${remaining} 次`}
             </span>
@@ -640,7 +640,7 @@ function Home() {
                     color: m.role === "user" ? "#0ea5e9" : "#10b981",
                   }}
                 >
-                  {m.role === "user" ? "你" : "小傻瓜"}
+                  {m.role === "user" ? "你" : "小金手"}
                 </span>
                 <span style={{ whiteSpace: "pre-wrap" }}>{m.content}</span>
               </div>
